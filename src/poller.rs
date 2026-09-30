@@ -11,12 +11,14 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, ResetCredit, ResetCreditsInfo, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -93,6 +95,20 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    #[serde(default)]
+    rate_limit_reset_credits: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CodexResetCreditsResponse {
+    available_count: Option<i64>,
+    credits: Option<Vec<CodexResetCreditDetails>>,
+}
+
+#[derive(Deserialize)]
+struct CodexResetCreditDetails {
+    status: Option<String>,
+    expires_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -893,7 +909,104 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+    let mut usage = codex_usage_from_response(response).ok_or(PollError::RequestFailed)?;
+    let summary_count = usage
+        .reset_credits
+        .as_ref()
+        .and_then(|credits| credits.available_count);
+    usage.reset_credits = Some(fetch_codex_reset_credits(token, account_id, summary_count));
+    Ok(usage)
+}
+
+fn fetch_codex_reset_credits(
+    token: &str,
+    account_id: Option<&str>,
+    summary_count: Option<usize>,
+) -> ResetCreditsInfo {
+    let agent = match build_agent() {
+        Ok(agent) => agent,
+        Err(_) => {
+            diagnose::log("Codex reset-credit details unavailable status=client_setup_failed");
+            return reset_credits_without_details(summary_count);
+        }
+    };
+    let mut request = agent
+        .get(CODEX_RESET_CREDITS_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "codex-cli")
+        .set("Accept", "application/json");
+    if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+        request = request.set("ChatGPT-Account-Id", account_id);
+    }
+
+    let response: CodexResetCreditsResponse = match request.call() {
+        Ok(response) => match response.into_json() {
+            Ok(response) => response,
+            Err(_) => {
+                diagnose::log("Codex reset-credit details unavailable status=invalid_response");
+                return reset_credits_without_details(summary_count);
+            }
+        },
+        Err(error) => {
+            let category = classify_ureq_error(&error).category();
+            diagnose::log(format!(
+                "Codex reset-credit details unavailable status={category}"
+            ));
+            return reset_credits_without_details(summary_count);
+        }
+    };
+
+    let info = reset_credits_from_response(response, summary_count);
+    diagnose::log(format!(
+        "Codex reset-credit details fetched count={} details={}",
+        info.available_count
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        info.credits.len()
+    ));
+    info
+}
+
+fn reset_credits_without_details(summary_count: Option<usize>) -> ResetCreditsInfo {
+    ResetCreditsInfo {
+        available_count: summary_count,
+        ..ResetCreditsInfo::default()
+    }
+}
+
+fn reset_credits_from_response(
+    response: CodexResetCreditsResponse,
+    summary_count: Option<usize>,
+) -> ResetCreditsInfo {
+    let mut info = reset_credits_without_details(summary_count);
+    // The usage summary is the count source of truth. The optional details
+    // endpoint supplies expiry dates only and can return a capped list.
+    let detail_count = response
+        .available_count
+        .and_then(|count| usize::try_from(count).ok());
+    if info.available_count.is_none() {
+        info.available_count = detail_count;
+    }
+    info.details_available = response.credits.is_some();
+    info.credits = response
+        .credits
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|credit| credit.status.as_deref() == Some("available"))
+        .map(|credit| ResetCredit {
+            expires_at: parse_iso8601(credit.expires_at.as_deref()),
+        })
+        .collect();
+    info.credits
+        .sort_by_key(|credit| (credit.expires_at.is_none(), credit.expires_at));
+    info
+}
+
+fn codex_summary_count(summary: Option<serde_json::Value>) -> Option<usize> {
+    summary
+        .as_ref()?
+        .get("available_count")?
+        .as_i64()
+        .and_then(|count| usize::try_from(count).ok())
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
@@ -904,6 +1017,13 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
 
     let primary = details.primary_window.flatten();
     let secondary = details.secondary_window.flatten();
+    let reset_credits =
+        codex_summary_count(response.rate_limit_reset_credits).map(|available_count| {
+            ResetCreditsInfo {
+                available_count: Some(available_count),
+                ..ResetCreditsInfo::default()
+            }
+        });
 
     for window in [primary.as_deref(), secondary.as_deref()]
         .into_iter()
@@ -938,6 +1058,7 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
         data.weekly = codex_section_from_window(window);
     }
 
+    data.reset_credits = reset_credits;
     Some(data)
 }
 
@@ -1009,7 +1130,11 @@ fn fetch_antigravity_usage_from_endpoint(
     let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
     let weekly = UsageSection::default();
 
-    Ok(UsageData { session, weekly })
+    Ok(UsageData {
+        session,
+        weekly,
+        reset_credits: None,
+    })
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1545,68 +1670,11 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     now >= exp
 }
 
-/// Parse an ISO 8601 timestamp string into a SystemTime.
+/// Parse an RFC3339 timestamp, respecting its UTC offset, into a SystemTime.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
-
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
-        }
-    }
-    None
-}
-
-/// Minimal datetime parser — avoids pulling in chrono/time crates.
-fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
-    // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
-    let (date_str, time_str) = s.split_once('T').ok_or(())?;
-    let date_parts: Vec<&str> = date_str.split('-').collect();
-    if date_parts.len() != 3 {
-        return Err(());
-    }
-
-    let year: u64 = date_parts[0].parse().map_err(|_| ())?;
-    let month: u64 = date_parts[1].parse().map_err(|_| ())?;
-    let day: u64 = date_parts[2].parse().map_err(|_| ())?;
-
-    // Strip fractional seconds
-    let time_base = time_str.split('.').next().unwrap_or(time_str);
-    let time_parts: Vec<&str> = time_base.split(':').collect();
-    if time_parts.len() != 3 {
-        return Err(());
-    }
-
-    let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
-    let min: u64 = time_parts[1].parse().map_err(|_| ())?;
-    let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
-
-    // Days from year (using a simplified calculation for dates after 1970)
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += month_days[m as usize];
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-    days += day - 1;
-
-    Ok(days * 86400 + hour * 3600 + min * 60 + sec)
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    let timestamp =
+        time::OffsetDateTime::parse(s?, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(SystemTime::from(timestamp))
 }
 
 /// Format a usage section for the compact taskbar display.
@@ -1759,6 +1827,7 @@ mod tests {
                 resets_at: None,
             },
             weekly: UsageSection::default(),
+            reset_credits: None,
         }
     }
 
@@ -1791,6 +1860,95 @@ mod tests {
         assert!(usage.session.resets_at.is_none());
         assert_eq!(usage.weekly.percentage, 21.0);
         assert!(usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn codex_reset_summary_distinguishes_zero_missing_and_invalid_counts() {
+        assert_eq!(
+            codex_summary_count(Some(serde_json::json!({"available_count": 0}))),
+            Some(0)
+        );
+        assert_eq!(codex_summary_count(None), None);
+        assert_eq!(
+            codex_summary_count(Some(serde_json::json!({"available_count": "bad"}))),
+            None
+        );
+
+        let response: CodexUsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {"used_percent": 12, "reset_at": 1790000000}},
+            "rate_limit_reset_credits": {"available_count": "unexpected"}
+        }))
+        .expect("malformed optional reset summary must not break usage parsing");
+        let usage = codex_usage_from_response(response).expect("usage should remain available");
+        assert_eq!(usage.session.percentage, 12.0);
+        assert!(usage.reset_credits.is_none());
+    }
+
+    #[test]
+    fn reset_credit_details_filter_unavailable_status_and_preserve_authoritative_count() {
+        let response: CodexResetCreditsResponse = serde_json::from_value(serde_json::json!({
+            "available_count": 2,
+            "credits": [
+                {"status":"available", "expires_at":"2026-10-30T02:12:38Z"},
+                {"status":"redeeming", "expires_at":"2026-10-01T00:00:00Z"},
+                {"status":"redeemed", "expires_at":"2026-10-02T00:00:00Z"},
+                {"status":"expired", "expires_at":"2026-10-03T00:00:00Z"},
+                {"status":"available", "expires_at":null}
+            ]
+        }))
+        .expect("reset-credit response should deserialize");
+        let credits = reset_credits_from_response(response, Some(4));
+
+        assert_eq!(credits.available_count, Some(4));
+        assert_eq!(credits.credits.len(), 2);
+        assert!(credits.credits[0].expires_at.is_some());
+        assert!(credits.credits[1].expires_at.is_none());
+        assert!(credits.details_available);
+    }
+
+    #[test]
+    fn detail_failure_fallback_keeps_summary_count_and_usage_windows() {
+        let response: CodexUsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {"used_percent": 12, "reset_at": 1790000000}},
+            "rate_limit_reset_credits": {"available_count": 4}
+        }))
+        .expect("usage response should deserialize");
+        let mut usage = codex_usage_from_response(response).expect("usage should parse");
+        let session_percentage = usage.session.percentage;
+        let count = usage
+            .reset_credits
+            .as_ref()
+            .and_then(|info| info.available_count);
+
+        usage.reset_credits = Some(reset_credits_without_details(count));
+
+        assert_eq!(usage.session.percentage, session_percentage);
+        assert_eq!(
+            usage
+                .reset_credits
+                .as_ref()
+                .and_then(|info| info.available_count),
+            Some(4)
+        );
+        assert!(usage
+            .reset_credits
+            .as_ref()
+            .is_some_and(|info| !info.details_available && info.credits.is_empty()));
+    }
+
+    #[test]
+    fn rfc3339_expiry_offsets_normalize_to_the_same_instant() {
+        let zulu = parse_iso8601(Some("2026-10-04T01:10:42Z")).unwrap();
+        let positive = parse_iso8601(Some("2026-10-04T06:10:42+05:00")).unwrap();
+        let negative = parse_iso8601(Some("2026-10-03T20:10:42-05:00")).unwrap();
+        assert_eq!(zulu, positive);
+        assert_eq!(zulu, negative);
+        assert_eq!(
+            zulu.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_791_076_242
+        );
+        assert!(parse_iso8601(Some("not-a-date")).is_none());
+        assert!(parse_iso8601(Some("2026-02-30T10:00:00Z")).is_none());
     }
 
     #[test]

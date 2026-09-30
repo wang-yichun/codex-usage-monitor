@@ -118,6 +118,8 @@ Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. 
 
 In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, one continuous progress bar, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
 
+When Codex reset credits are available, small square cells to the right of the quota rows show each credit's local expiry day. The **Reset cards** context-menu submenu lists full local expiry timestamps; the **Usage display** submenu can hide the cells. This metadata uses a read-only Codex endpoint and is kept separate from usage-window data when the detail request is unavailable.
+
 ## Diagnostics
 
 If you need to troubleshoot startup or visibility issues, run:

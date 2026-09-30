@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
@@ -75,6 +75,7 @@ struct AppState {
     claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
+    show_reset_cards: bool,
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
@@ -145,6 +146,7 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
+const IDM_SHOW_RESET_CARDS: u16 = 73;
 const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
@@ -397,6 +399,8 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
+    #[serde(default = "default_show_reset_cards")]
+    show_reset_cards: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
     #[serde(default = "default_show_usage_window")]
@@ -428,6 +432,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
+            show_reset_cards: true,
             show_antigravity: false,
             show_session_window: true,
             show_weekly_window: true,
@@ -458,6 +463,10 @@ fn default_show_claude_code() -> bool {
 }
 
 fn default_show_codex() -> bool {
+    true
+}
+
+fn default_show_reset_cards() -> bool {
     true
 }
 
@@ -562,6 +571,7 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
+            show_reset_cards: s.show_reset_cards,
             show_antigravity: s.show_antigravity,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
@@ -585,6 +595,73 @@ fn format_local_system_time(local: SYSTEMTIME) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
     )
+}
+
+fn reset_credit_menu_lines(
+    credits: Option<&crate::models::ResetCreditsInfo>,
+    language: LanguageId,
+    last_poll_ok: bool,
+) -> Vec<String> {
+    let chinese = language == LanguageId::SimplifiedChinese;
+    if !last_poll_ok {
+        return vec![if chinese {
+            "重置卡暂不可用（刷新失败）".to_string()
+        } else {
+            "Reset credits unavailable (refresh failed)".to_string()
+        }];
+    }
+    let Some(credits) = credits else {
+        return vec![if chinese {
+            "重置卡暂不可用".to_string()
+        } else {
+            "Reset credits unavailable".to_string()
+        }];
+    };
+    let Some(count) = credits.available_count else {
+        return vec![if chinese {
+            "重置卡暂不可用".to_string()
+        } else {
+            "Reset credits unavailable".to_string()
+        }];
+    };
+    let mut lines = vec![if chinese {
+        format!("可用重置卡：{count}")
+    } else {
+        format!("Available reset credits: {count}")
+    }];
+    if count == 0 {
+        lines.push(if chinese {
+            "暂无可用重置卡".to_string()
+        } else {
+            "No reset credits available".to_string()
+        });
+        return lines;
+    }
+    for index in 0..count.min(MAX_RESET_CARD_MENU_ROWS) {
+        let expiry = credits
+            .credits
+            .get(index)
+            .and_then(|credit| credit.expires_at)
+            .and_then(native_interop::system_time_to_local)
+            .map(format_local_system_time)
+            .unwrap_or_else(|| {
+                if chinese {
+                    "未知".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            });
+        lines.push(format!("{}  {expiry}", index + 1));
+    }
+    if count > MAX_RESET_CARD_MENU_ROWS {
+        let remaining = count - MAX_RESET_CARD_MENU_ROWS;
+        lines.push(if chinese {
+            format!("另有 {remaining} 张重置卡")
+        } else {
+            format!("Additional reset credits: {remaining}")
+        });
+    }
+    lines
 }
 
 fn service_tooltip(
@@ -1491,6 +1568,15 @@ const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
+const SESSION_WINDOW_SECS: u64 = 5 * 60 * 60;
+const WEEKLY_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+const TIME_PROGRESS_H: i32 = 2;
+const TIME_PROGRESS_GAP: i32 = 1;
+const RESET_CARD_SIZE: i32 = 16;
+const RESET_CARDS_GAP: i32 = 2;
+const RESET_CARDS_LEFT_GAP: i32 = 3;
+const MAX_RESET_CARD_CELLS: usize = 8;
+const MAX_RESET_CARD_MENU_ROWS: usize = 100;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
@@ -1567,20 +1653,132 @@ fn usage_percent_for_display(
     }
 }
 
-fn total_widget_width_for(active_models: i32, language: LanguageId, text_style: TextStyle) -> i32 {
+fn reset_cards_column_width(count: Option<usize>, show_codex: bool, show_reset_cards: bool) -> i32 {
+    if !show_codex || !show_reset_cards || count.unwrap_or(0) == 0 {
+        return 0;
+    }
+    let visible_columns = reset_credit_column_count(count.unwrap_or_default());
+    let visible_width = if count.unwrap_or_default() > MAX_RESET_CARD_CELLS {
+        visible_columns as i32 * (RESET_CARD_SIZE + RESET_CARDS_GAP)
+    } else {
+        visible_columns as i32 * (RESET_CARD_SIZE + RESET_CARDS_GAP) - RESET_CARDS_GAP
+    };
+    sc(RESET_CARDS_LEFT_GAP + 1 + RESET_CARDS_GAP)
+        + sc(visible_width)
+        + sc(reset_cards_overflow_width(count.unwrap_or_default()))
+}
+
+fn reset_credit_column_count(count: usize) -> usize {
+    count.min(MAX_RESET_CARD_CELLS).div_ceil(2)
+}
+
+fn reset_cards_overflow_width(count: usize) -> i32 {
+    if count <= MAX_RESET_CARD_CELLS {
+        return 0;
+    }
+    // Reserve enough room for a compact "+N" marker while keeping pathological values bounded.
+    let remaining = count - MAX_RESET_CARD_CELLS;
+    (10 + remaining.ilog10() as i32 * 7).min(48)
+}
+
+fn total_widget_width_for(
+    active_models: i32,
+    language: LanguageId,
+    text_style: TextStyle,
+    reset_credit_count: Option<usize>,
+    show_codex: bool,
+    show_reset_cards: bool,
+    last_text_width: Option<i32>,
+) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, text_style);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(text_width);
+    let model_bar_and_margin =
+        (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+            + sc(BAR_RIGHT_MARGIN);
+    let model_width = model_bar_and_margin + sc(text_width);
+    let cards_visible = show_codex && show_reset_cards && reset_credit_count.unwrap_or(0) > 0;
+    let final_model_width = model_bar_and_margin
+        + if cards_visible {
+            last_text_width.unwrap_or(sc(text_width))
+        } else {
+            sc(text_width)
+        };
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
         + sc(label_width)
         + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
+        + model_width * (active_models - 1)
+        + final_model_width
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
+        + reset_cards_column_width(reset_credit_count, show_codex, show_reset_cards)
         + sc(RIGHT_MARGIN)
+}
+
+fn last_visible_usage_texts(state: &AppState) -> Vec<String> {
+    let Some(data) = state.data.as_ref() else {
+        return Vec::new();
+    };
+    let (session_text, weekly_text, session, weekly) = if state.show_antigravity {
+        let Some(usage) = data.antigravity.as_ref() else {
+            return vec!["!".to_string()];
+        };
+        let weekly = (usage.weekly.resets_at.is_some() || usage.weekly.percentage != 0.0)
+            .then_some(&usage.weekly);
+        (
+            &state.antigravity_session_text,
+            &state.antigravity_weekly_text,
+            Some(&usage.session),
+            weekly,
+        )
+    } else if state.show_codex {
+        let Some(usage) = data.codex.as_ref() else {
+            return vec!["!".to_string()];
+        };
+        (
+            &state.codex_session_text,
+            &state.codex_weekly_text,
+            Some(&usage.session),
+            Some(&usage.weekly),
+        )
+    } else {
+        let Some(usage) = data.claude_code.as_ref() else {
+            return vec!["!".to_string()];
+        };
+        (
+            &state.session_text,
+            &state.weekly_text,
+            Some(&usage.session),
+            Some(&usage.weekly),
+        )
+    };
+
+    let mut texts = Vec::with_capacity(2);
+    if state.show_session_window {
+        texts.push(if state.text_style == TextStyle::Compact {
+            compact_text_or_original(
+                session_text,
+                session,
+                state.language,
+                state.last_poll_ok,
+            )
+        } else {
+            session_text.clone()
+        });
+    }
+    if state.show_weekly_window {
+        texts.push(if state.text_style == TextStyle::Compact {
+            compact_text_or_original(
+                weekly_text,
+                weekly,
+                state.language,
+                state.last_poll_ok,
+            )
+        } else {
+            weekly_text.clone()
+        });
+    }
+    texts
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -1592,24 +1790,43 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
         ),
         state.language,
         state.text_style,
+        state
+            .data
+            .as_ref()
+            .and_then(|data| data.codex.as_ref())
+            .and_then(|codex| codex.reset_credits.as_ref())
+            .and_then(|credits| credits.available_count),
+        state.show_codex,
+        state.show_reset_cards,
+        measure_usage_texts_width(&last_visible_usage_texts(state)),
     )
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, text_style) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
-                    s.language,
-                    s.text_style,
-                )
-            })
-            .unwrap_or((1, LanguageId::English, TextStyle::Compact))
+    let state = lock_state();
+    let Some(state) = state.as_ref() else {
+        return total_widget_width_for(1, LanguageId::English, TextStyle::Compact, None, false, false, None);
     };
-    total_widget_width_for(active_models, language, text_style)
+    let active_models = active_model_count(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    );
+    let count = state
+        .data
+        .as_ref()
+        .and_then(|data| data.codex.as_ref())
+        .and_then(|codex| codex.reset_credits.as_ref())
+        .and_then(|credits| credits.available_count);
+    total_widget_width_for(
+        active_models,
+        state.language,
+        state.text_style,
+        count,
+        state.show_codex,
+        state.show_reset_cards,
+        measure_usage_texts_width(&last_visible_usage_texts(state)),
+    )
 }
 
 fn claude_accent_color() -> Color {
@@ -1776,6 +1993,58 @@ fn compact_text_or_original(
         .unwrap_or_else(|| original.to_string())
 }
 
+fn measure_usage_text_width_in(hdc: HDC, text: &str) -> Option<i32> {
+    let wide = native_interop::wide_str(text);
+    unsafe {
+        let mut size = SIZE::default();
+        GetTextExtentPoint32W(
+            hdc,
+            &wide[..wide.len().saturating_sub(1)],
+            &mut size,
+        )
+        .as_bool()
+        .then_some(size.cx)
+    }
+}
+
+fn measure_usage_texts_width(texts: &[String]) -> Option<i32> {
+    if texts.is_empty() {
+        return None;
+    }
+    unsafe {
+        let hdc = CreateCompatibleDC(HDC::default());
+        if hdc.is_invalid() {
+            return None;
+        }
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+        let width = texts
+            .iter()
+            .filter_map(|text| measure_usage_text_width_in(hdc, text))
+            .max();
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = DeleteDC(hdc);
+        width
+    }
+}
+
 fn antigravity_usage_text_color(is_dark: bool) -> Color {
     if is_dark {
         Color::from_hex("#8AB4F8")
@@ -1880,7 +2149,15 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count, language, settings.text_style),
+            total_widget_width_for(
+                initial_model_count,
+                language,
+                settings.text_style,
+                None,
+                settings.show_codex,
+                settings.show_reset_cards,
+                None,
+            ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1942,6 +2219,7 @@ pub fn run() {
                 claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
+                show_reset_cards: settings.show_reset_cards,
                 show_antigravity: settings.show_antigravity,
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
@@ -2075,6 +2353,7 @@ fn render_layered() {
         antigravity_weekly_text,
         show_claude_code,
         show_codex,
+        show_reset_cards,
         show_antigravity,
         show_session_window,
         show_weekly_window,
@@ -2106,6 +2385,7 @@ fn render_layered() {
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.show_reset_cards,
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
@@ -2197,6 +2477,7 @@ fn render_layered() {
             &antigravity_weekly_text,
             show_claude_code,
             show_codex,
+            show_reset_cards,
             show_antigravity,
             show_session_window,
             show_weekly_window,
@@ -2289,6 +2570,7 @@ fn paint_content(
     antigravity_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
+    show_reset_cards: bool,
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
@@ -2427,10 +2709,12 @@ fn paint_content(
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row_gap = sc(4);
         let row_height = sc(SEGMENT_H);
-        let rows_height = row_height * 2 + row_gap;
+        // Reserve the progress line below the final row when centering the group.
+        let rows_height = row_height * 2 + row_gap + sc(TIME_PROGRESS_GAP) + sc(TIME_PROGRESS_H);
         let row1_y = (height - rows_height) / 2;
         let row2_y = row1_y + row_height + row_gap;
-        let single_row_y = (height - sc(SEGMENT_H)) / 2;
+        let single_row_y =
+            (height - sc(SEGMENT_H) - sc(TIME_PROGRESS_GAP) - sc(TIME_PROGRESS_H)) / 2;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -2483,6 +2767,9 @@ fn paint_content(
                 text_width,
                 bar_style,
                 text_style,
+                poller::UsageWindowKind::Session,
+                data,
+                last_poll_ok,
             );
         }
         if show_weekly_window {
@@ -2514,7 +2801,58 @@ fn paint_content(
                 text_width,
                 bar_style,
                 text_style,
+                poller::UsageWindowKind::Weekly,
+                data,
+                last_poll_ok,
             );
+        }
+
+        if show_codex && show_reset_cards && last_poll_ok {
+            if let Some(credits) = data
+                .and_then(|data| data.codex.as_ref())
+                .and_then(|codex| codex.reset_credits.as_ref())
+            {
+                if let Some(count) = credits.available_count.filter(|count| *count > 0) {
+                    let bar_segments = row_bar_segment_count(active_model_count(
+                        show_claude_code,
+                        show_codex,
+                        show_antigravity,
+                    ));
+                    let model_width = model_usage_width(bar_segments, text_width);
+                    let reserved_models_end = content_x
+                        + sc(label_width + LABEL_RIGHT_MARGIN)
+                        + active_model_count(show_claude_code, show_codex, show_antigravity)
+                            * (model_width + sc(MODEL_RIGHT_MARGIN))
+                        - sc(MODEL_RIGHT_MARGIN);
+                    let last_provider_texts = if show_antigravity {
+                        [
+                            show_session_window.then_some(antigravity_session_text.as_str()),
+                            show_weekly_window.then_some(antigravity_weekly_text.as_str()),
+                        ]
+                    } else if show_codex {
+                        [
+                            show_session_window.then_some(codex_session_text.as_str()),
+                            show_weekly_window.then_some(codex_weekly_text.as_str()),
+                        ]
+                    } else {
+                        [
+                            show_session_window.then_some(session_text.as_str()),
+                            show_weekly_window.then_some(weekly_text.as_str()),
+                        ]
+                    };
+                    let actual_text_width = last_provider_texts
+                        .iter()
+                        .flatten()
+                        .filter_map(|text| measure_usage_text_width_in(hdc, text))
+                        .max()
+                        .unwrap_or(sc(text_width));
+                    let models_end = reserved_models_end - sc(text_width) + actual_text_width;
+                    let separator_x = models_end + sc(RESET_CARDS_LEFT_GAP);
+                    let cards_x = separator_x + sc(1 + RESET_CARDS_GAP);
+                    draw_reset_credit_grid(hdc, cards_x, height, count, credits, is_dark);
+                    draw_small_divider(hdc, separator_x, height, is_dark);
+                }
+            }
         }
 
         SelectObject(hdc, old_font);
@@ -2814,6 +3152,9 @@ fn schedule_countdown_timer() {
 
     let ms = min_delay
         .unwrap_or(Duration::from_secs(60))
+        // Keep the time progress line moving even when countdown text changes
+        // only once per hour or once per day.
+        .min(Duration::from_secs(60))
         .as_millis()
         .max(1000) as u32;
 
@@ -3167,6 +3508,7 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            position_at_taskbar();
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -3477,6 +3819,17 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_SHOW_RESET_CARDS => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.show_reset_cards = !s.show_reset_cards;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 IDM_ALERT_OFF | IDM_ALERT_10 | IDM_ALERT_20 | IDM_ALERT_30 => {
                     let threshold = match id {
                         IDM_ALERT_10 => 10,
@@ -3671,6 +4024,8 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             claude_code_available,
             show_codex,
+            show_reset_cards,
+            reset_credit_lines,
             show_antigravity,
             show_session_window,
             show_weekly_window,
@@ -3693,6 +4048,15 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.claude_code_available,
                     s.show_codex,
+                    s.show_reset_cards,
+                    reset_credit_menu_lines(
+                        s.data
+                            .as_ref()
+                            .and_then(|data| data.codex.as_ref())
+                            .and_then(|codex| codex.reset_credits.as_ref()),
+                        s.language,
+                        s.last_poll_ok,
+                    ),
                     s.show_antigravity,
                     s.show_session_window,
                     s.show_weekly_window,
@@ -3713,6 +4077,8 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    true,
+                    vec!["Reset credits unavailable".to_string()],
                     false,
                     true,
                     true,
@@ -3853,6 +4219,23 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SHOW_WEEKLY_WINDOW as usize,
             PCWSTR::from_raw(weekly_label.as_ptr()),
         );
+        let reset_cards_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "重置卡显示"
+            } else {
+                "Show reset cards"
+            });
+        let reset_cards_flags = if show_reset_cards {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            usage_menu,
+            reset_cards_flags,
+            IDM_SHOW_RESET_CARDS as usize,
+            PCWSTR::from_raw(reset_cards_label.as_ptr()),
+        );
         let usage_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
             "显示用量"
         } else {
@@ -3863,6 +4246,29 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             usage_menu.0 as usize,
             PCWSTR::from_raw(usage_label.as_ptr()),
+        );
+
+        let reset_credits_menu = CreatePopupMenu().unwrap();
+        for line in &reset_credit_lines {
+            let item = native_interop::wide_str(line);
+            let _ = AppendMenuW(
+                reset_credits_menu,
+                MF_GRAYED,
+                0,
+                PCWSTR::from_raw(item.as_ptr()),
+            );
+        }
+        let reset_credits_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "重置卡"
+            } else {
+                "Reset cards"
+            });
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            reset_credits_menu.0 as usize,
+            PCWSTR::from_raw(reset_credits_label.as_ptr()),
         );
 
         let appearance_menu = CreatePopupMenu().unwrap();
@@ -4222,6 +4628,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_weekly_text,
         show_claude_code,
         show_codex,
+        show_reset_cards,
         show_antigravity,
         show_session_window,
         show_weekly_window,
@@ -4250,6 +4657,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.show_reset_cards,
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
@@ -4306,6 +4714,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &antigravity_weekly_text,
             show_claude_code,
             show_codex,
+            show_reset_cards,
             show_antigravity,
             show_session_window,
             show_weekly_window,
@@ -4349,6 +4758,9 @@ fn draw_row(
     text_width: i32,
     bar_style: BarStyle,
     text_style: TextStyle,
+    window_kind: poller::UsageWindowKind,
+    data: Option<&AppUsageData>,
+    last_poll_ok: bool,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -4369,6 +4781,24 @@ fn draw_row(
     } else {
         *text_color
     };
+    let window_duration = match window_kind {
+        poller::UsageWindowKind::Session => SESSION_WINDOW_SECS,
+        poller::UsageWindowKind::Weekly => WEEKLY_WINDOW_SECS,
+    };
+    let reset_for = |usage: Option<&UsageData>| {
+        let section = usage.map(|usage| match window_kind {
+            poller::UsageWindowKind::Session => &usage.session,
+            poller::UsageWindowKind::Weekly => &usage.weekly,
+        });
+        last_poll_ok
+            .then(|| section.and_then(|section| section.resets_at))
+            .flatten()
+            .and_then(|reset| time_remaining_ratio(Some(reset), window_duration, SystemTime::now()))
+    };
+    let claude_time_remaining = reset_for(data.and_then(|data| data.claude_code.as_ref()));
+    let codex_time_remaining = reset_for(data.and_then(|data| data.codex.as_ref()));
+    let antigravity_time_remaining = reset_for(data.and_then(|data| data.antigravity.as_ref()));
+    let time_progress_color = Color::from_hex(if is_dark { "#8A9099" } else { "#6B7280" });
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -4400,6 +4830,8 @@ fn draw_row(
                 &claude_value_color,
                 text_width,
                 bar_style,
+                claude_time_remaining,
+                &time_progress_color,
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -4421,6 +4853,8 @@ fn draw_row(
                 &codex_value_color,
                 text_width,
                 bar_style,
+                codex_time_remaining,
+                &time_progress_color,
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -4437,6 +4871,8 @@ fn draw_row(
                 &antigravity_value_color,
                 text_width,
                 bar_style,
+                antigravity_time_remaining,
+                &time_progress_color,
             );
         }
     }
@@ -4446,6 +4882,143 @@ fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(text_width)
+}
+
+fn time_remaining_ratio(
+    resets_at: Option<SystemTime>,
+    window_duration_secs: u64,
+    now: SystemTime,
+) -> Option<f64> {
+    let reset = resets_at?;
+    if window_duration_secs == 0 {
+        return Some(0.0);
+    }
+    let remaining = reset
+        .duration_since(now)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    Some((remaining / window_duration_secs as f64).clamp(0.0, 1.0))
+}
+
+fn draw_small_divider(hdc: HDC, x: i32, height: i32, is_dark: bool) {
+    unsafe {
+        let color = Color::from_hex(if is_dark { "#626873" } else { "#8B9098" });
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        let grid_height = sc(RESET_CARD_SIZE * 2 + RESET_CARDS_GAP);
+        let top = (height - grid_height) / 2;
+        let rect = RECT {
+            left: x,
+            top,
+            right: x + sc(1),
+            bottom: top + grid_height,
+        };
+        FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(brush);
+    }
+}
+
+fn reset_credit_display_days(credits: &crate::models::ResetCreditsInfo) -> Vec<String> {
+    let count = credits
+        .available_count
+        .unwrap_or_default()
+        .min(MAX_RESET_CARD_CELLS);
+    (0..count)
+        .map(|index| {
+            credits
+                .credits
+                .get(index)
+                .and_then(|credit| credit.expires_at)
+                .and_then(native_interop::system_time_to_local)
+                .map(|local| local.wDay.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        })
+        .collect()
+}
+
+fn draw_reset_credit_grid(
+    hdc: HDC,
+    x: i32,
+    height: i32,
+    count: usize,
+    credits: &crate::models::ResetCreditsInfo,
+    is_dark: bool,
+) {
+    let visible_count = count.min(MAX_RESET_CARD_CELLS);
+    let days = reset_credit_display_days(credits);
+    let grid_height = sc(RESET_CARD_SIZE * 2 + RESET_CARDS_GAP);
+    let top = (height - grid_height) / 2;
+    let cell_size = sc(RESET_CARD_SIZE);
+    let cell_gap = sc(RESET_CARDS_GAP);
+    let border_color = Color::from_hex(if is_dark { "#8A9099" } else { "#535A64" });
+    let text_color = Color::from_hex(if is_dark { "#A0A6B0" } else { "#444B55" });
+    unsafe {
+        let border_brush = CreateSolidBrush(COLORREF(border_color.to_colorref()));
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-10),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+
+        for index in 0..visible_count {
+            let col = index / 2;
+            let row = index % 2;
+            let left = x + col as i32 * (cell_size + cell_gap);
+            let upper = top + row as i32 * (cell_size + cell_gap);
+            let rect = RECT {
+                left,
+                top: upper,
+                right: left + cell_size,
+                bottom: upper + cell_size,
+            };
+            let _ = FrameRect(hdc, &rect, border_brush);
+            let value = days.get(index).map(String::as_str).unwrap_or("?");
+            let mut wide: Vec<u16> = value.encode_utf16().collect();
+            let mut text_rect = rect;
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+
+        if count > MAX_RESET_CARD_CELLS {
+            let overflow = format!("+{}", count - MAX_RESET_CARD_CELLS);
+            let mut wide: Vec<u16> = overflow.encode_utf16().collect();
+            let columns = reset_credit_column_count(count);
+            let left = x + columns as i32 * (cell_size + cell_gap);
+            let mut text_rect = RECT {
+                left,
+                top,
+                right: left + sc(reset_cards_overflow_width(count)),
+                bottom: top + grid_height,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut text_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = DeleteObject(border_brush);
+    }
 }
 
 fn draw_usage_bar(
@@ -4460,6 +5033,8 @@ fn draw_usage_bar(
     text_color: &Color,
     text_width: i32,
     bar_style: BarStyle,
+    time_remaining: Option<f64>,
+    time_progress_color: &Color,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -4524,6 +5099,23 @@ fn draw_usage_bar(
                     FillRect(hdc, &fill_rect, brush);
                     let _ = DeleteObject(brush);
                 }
+            }
+        }
+
+        if let Some(progress) = time_remaining {
+            let progress_h = sc(TIME_PROGRESS_H);
+            let progress_top = y + seg_h + sc(TIME_PROGRESS_GAP);
+            let progress_width = (bar_width as f64 * progress.clamp(0.0, 1.0)).round() as i32;
+            if progress_width > 0 {
+                let brush = CreateSolidBrush(COLORREF(time_progress_color.to_colorref()));
+                let rect = RECT {
+                    left: bar_x,
+                    top: progress_top,
+                    right: bar_x + progress_width,
+                    bottom: progress_top + progress_h,
+                };
+                FillRect(hdc, &rect, brush);
+                let _ = DeleteObject(brush);
             }
         }
 
@@ -4622,8 +5214,36 @@ mod tests {
         assert_eq!(settings.bar_style, BarStyle::Segmented);
         assert_eq!(settings.text_style, TextStyle::Compact);
         assert!(settings.transparent_background);
+        assert!(settings.show_reset_cards);
         assert_eq!(settings.tray_offset, 321);
         assert_eq!(settings.language.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn reset_credit_menu_distinguishes_unavailable_zero_and_caps_rows() {
+        assert_eq!(
+            reset_credit_menu_lines(None, LanguageId::English, true),
+            vec!["Reset credits unavailable"]
+        );
+        let zero = crate::models::ResetCreditsInfo {
+            available_count: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            reset_credit_menu_lines(Some(&zero), LanguageId::English, true),
+            vec!["Available reset credits: 0", "No reset credits available"]
+        );
+
+        let many = crate::models::ResetCreditsInfo {
+            available_count: Some(101),
+            ..Default::default()
+        };
+        let lines = reset_credit_menu_lines(Some(&many), LanguageId::English, true);
+        assert_eq!(lines.len(), 102);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Additional reset credits: 1")
+        );
     }
 
     #[test]
@@ -4662,6 +5282,30 @@ mod tests {
             compact_usage_text(&section, LanguageId::English),
             "56% left · 2h 15m"
         );
+    }
+
+    #[test]
+    fn time_progress_ratio_tracks_remaining_time_and_clamps_window_edges() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let reset_in_90_minutes = now + Duration::from_secs(90 * 60);
+
+        assert_eq!(
+            time_remaining_ratio(Some(reset_in_90_minutes), SESSION_WINDOW_SECS, now),
+            Some(0.3)
+        );
+        assert_eq!(
+            time_remaining_ratio(
+                Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS + 10)),
+                WEEKLY_WINDOW_SECS,
+                now
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            time_remaining_ratio(Some(now - Duration::from_secs(1)), SESSION_WINDOW_SECS, now),
+            Some(0.0)
+        );
+        assert_eq!(time_remaining_ratio(None, SESSION_WINDOW_SECS, now), None);
     }
 
     #[test]
