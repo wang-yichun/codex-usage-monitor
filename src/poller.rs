@@ -901,13 +901,17 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
-    let response: CodexUsageResponse = match resp.into_json() {
+    let raw: serde_json::Value = match resp.into_json() {
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error("unable to parse Codex usage response", error);
             return Err(PollError::RequestFailed);
         }
     };
+
+    let response: CodexUsageResponse = serde_json::from_value(raw.clone())
+        .map_err(|_| PollError::RequestFailed)?;
+    crate::account_panel::update_usage(&raw);
 
     let mut usage = codex_usage_from_response(response).ok_or(PollError::RequestFailed)?;
     let summary_count = usage
@@ -923,6 +927,7 @@ fn fetch_codex_reset_credits(
     account_id: Option<&str>,
     summary_count: Option<usize>,
 ) -> ResetCreditsInfo {
+    crate::account_panel::update_cards(None);
     let agent = match build_agent() {
         Ok(agent) => agent,
         Err(_) => {
@@ -940,8 +945,14 @@ fn fetch_codex_reset_credits(
     }
 
     let response: CodexResetCreditsResponse = match request.call() {
-        Ok(response) => match response.into_json() {
-            Ok(response) => response,
+        Ok(response) => match response.into_json::<serde_json::Value>() {
+            Ok(raw) => {
+                crate::account_panel::update_cards(Some(&raw));
+                match serde_json::from_value(raw) {
+                    Ok(response) => response,
+                    Err(_) => return reset_credits_without_details(summary_count),
+                }
+            },
             Err(_) => {
                 diagnose::log("Codex reset-credit details unavailable status=invalid_response");
                 return reset_credits_without_details(summary_count);
@@ -1680,7 +1691,7 @@ fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
 /// Format a usage section for the compact taskbar display.
 pub fn format_line(
     section: &UsageSection,
-    strings: Strings,
+    _strings: Strings,
     show_remaining_in_chinese: bool,
     window: UsageWindowKind,
 ) -> String {
@@ -1689,11 +1700,15 @@ pub fn format_line(
     }
 
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
-    if cd.is_empty() {
-        pct
-    } else {
-        format!("{pct} \u{00b7} {cd}")
+    match section.resets_at.and_then(native_interop::system_time_to_local) {
+        Some(reset) => {
+            let reset_time = match window {
+                UsageWindowKind::Session => format!("{:02}:{:02}", reset.wHour, reset.wMinute),
+                UsageWindowKind::Weekly => format!("{:02}/{:02}", reset.wMonth, reset.wDay),
+            };
+            format!("{pct} \u{00b7} {reset_time}")
+        }
+        None => pct,
     }
 }
 
@@ -1731,20 +1746,6 @@ fn format_simplified_chinese_values(
 
 pub fn remaining_percentage(used_percentage: f64) -> f64 {
     (100.0 - used_percentage).clamp(0.0, 100.0)
-}
-
-fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
-    let reset = match resets_at {
-        Some(t) => t,
-        None => return String::new(),
-    };
-
-    let remaining = match reset.duration_since(SystemTime::now()) {
-        Ok(d) => d,
-        Err(_) => return strings.now.to_string(),
-    };
-
-    format_countdown_from_secs(remaining.as_secs(), strings)
 }
 
 /// Calculate how long until the display text would change

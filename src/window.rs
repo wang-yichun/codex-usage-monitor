@@ -13,7 +13,8 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TME_HOVER, TME_LEAVE};
+use windows::Win32::UI::Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -170,7 +171,7 @@ enum AppearanceTheme {
 
 impl Default for AppearanceTheme {
     fn default() -> Self {
-        Self::Dark
+        Self::System
     }
 }
 
@@ -1583,7 +1584,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 96;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
 const COMPACT_ENGLISH_TEXT_WIDTH: i32 = 130;
@@ -2298,6 +2299,8 @@ pub fn run() {
         // (WM_TIMER included), so a timer would never fire again.
         spawn_taskbar_watchdog();
 
+        crate::token_tooltip::start(hwnd);
+
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         std::thread::spawn(move || {
@@ -2707,7 +2710,7 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row_gap = sc(4);
+        let row_gap = sc(6);
         let row_height = sc(SEGMENT_H);
         // Reserve the progress line below the final row when centering the group.
         let rows_height = row_height * 2 + row_gap + sc(TIME_PROGRESS_GAP) + sc(TIME_PROGRESS_H);
@@ -2849,7 +2852,7 @@ fn paint_content(
                     let models_end = reserved_models_end - sc(text_width) + actual_text_width;
                     let separator_x = models_end + sc(RESET_CARDS_LEFT_GAP);
                     let cards_x = separator_x + sc(1 + RESET_CARDS_GAP);
-                    draw_reset_credit_grid(hdc, cards_x, height, count, credits, is_dark);
+                    draw_reset_credit_grid(hdc, cards_x, height, count, credits, is_dark, text_style);
                     draw_small_divider(hdc, separator_x, height, is_dark);
                 }
             }
@@ -3402,6 +3405,10 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_TIMER if wparam.0 == crate::token_tooltip::TIMER_BUBBLE => {
+            crate::token_tooltip::tick(hwnd);
+            LRESULT(0)
+        }
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
@@ -3545,9 +3552,14 @@ unsafe extern "system" fn wnd_proc(
                 let state = lock_state();
                 state.as_ref().map(|s| s.preview_mode).unwrap_or(false)
             };
-            if preview_mode || !is_drag_handle_point(client_x, client_y) {
+            if preview_mode {
                 return LRESULT(0);
             }
+            if !is_drag_handle_point(client_x, client_y) {
+                return LRESULT(0);
+            }
+
+            crate::token_tooltip::hide(hwnd);
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -3561,7 +3573,25 @@ unsafe extern "system" fn wnd_proc(
             SetCapture(hwnd);
             LRESULT(0)
         }
+        WM_MOUSEHOVER => {
+            let (language, allowed) = lock_state().as_ref()
+                .map(|s| (s.language, !s.dragging && !s.preview_mode))
+                .unwrap_or((LanguageId::English, false));
+            if allowed { crate::token_tooltip::show(hwnd, language); }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            crate::token_tooltip::tick(hwnd);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_HOVER | TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 350,
+            };
+            let _ = TrackMouseEvent(&mut tracking);
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -3996,6 +4026,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            crate::token_tooltip::stop();
             let hook = {
                 let state = lock_state();
                 state.as_ref().and_then(|s| s.win_event_hook)
@@ -4271,6 +4302,44 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_credits_label.as_ptr()),
         );
 
+        let natural_reset_menu = CreatePopupMenu().unwrap();
+        {
+            let state = lock_state();
+            if let Some(s) = state.as_ref() {
+                for (enabled, provider, usage) in [
+                    (s.show_claude_code, "Claude Code", s.data.as_ref().and_then(|d| d.claude_code.as_ref())),
+                    (s.show_codex, "Codex", s.data.as_ref().and_then(|d| d.codex.as_ref())),
+                    (s.show_antigravity, "Antigravity", s.data.as_ref().and_then(|d| d.antigravity.as_ref())),
+                ] {
+                    if !enabled {
+                        continue;
+                    }
+                    for (label, section) in [
+                        ("5h", usage.map(|u| &u.session)),
+                        ("7d", usage.map(|u| &u.weekly)),
+                    ] {
+                        let reset = s.last_poll_ok
+                            .then(|| section.and_then(|section| section.resets_at))
+                            .flatten()
+                            .and_then(|time| format_precise_reset_time(Some(time)))
+                            .unwrap_or_else(|| if language == LanguageId::SimplifiedChinese {
+                                "未知".to_string()
+                            } else {
+                                "Unknown".to_string()
+                            });
+                        let item = native_interop::wide_str(&format!("{provider} {label}: {reset}"));
+                        let _ = AppendMenuW(natural_reset_menu, MF_GRAYED, 0, PCWSTR::from_raw(item.as_ptr()));
+                    }
+                }
+            }
+        }
+        let natural_reset_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "自然重置时间"
+        } else {
+            "Natural reset times"
+        });
+        let _ = AppendMenuW(menu, MF_POPUP, natural_reset_menu.0 as usize, PCWSTR::from_raw(natural_reset_label.as_ptr()));
+
         let appearance_menu = CreatePopupMenu().unwrap();
         let is_zh = language == LanguageId::SimplifiedChinese;
         let appearance_items = [
@@ -4356,18 +4425,18 @@ fn show_context_menu(hwnd: HWND) {
                 IDM_TEXT_DETAILED,
                 text_style == TextStyle::Detailed,
                 if is_zh {
-                    "详细文字"
+                    "用量模式"
                 } else {
-                    "Detailed text"
+                    "Usage mode"
                 },
             ),
             (
                 IDM_TEXT_COMPACT,
                 text_style == TextStyle::Compact,
                 if is_zh {
-                    "紧凑文字"
+                    "余量模式"
                 } else {
-                    "Compact text"
+                    "Remaining mode"
                 },
             ),
         ] {
@@ -4794,6 +4863,10 @@ fn draw_row(
             .then(|| section.and_then(|section| section.resets_at))
             .flatten()
             .and_then(|reset| time_remaining_ratio(Some(reset), window_duration, SystemTime::now()))
+            .map(|remaining| match text_style {
+                TextStyle::Detailed => 1.0 - remaining,
+                TextStyle::Compact => remaining,
+            })
     };
     let claude_time_remaining = reset_for(data.and_then(|data| data.claude_code.as_ref()));
     let codex_time_remaining = reset_for(data.and_then(|data| data.codex.as_ref()));
@@ -4917,7 +4990,11 @@ fn draw_small_divider(hdc: HDC, x: i32, height: i32, is_dark: bool) {
     }
 }
 
-fn reset_credit_display_days(credits: &crate::models::ResetCreditsInfo) -> Vec<String> {
+fn reset_credit_display_days(
+    credits: &crate::models::ResetCreditsInfo,
+    text_style: TextStyle,
+    now: SystemTime,
+) -> Vec<String> {
     let count = credits
         .available_count
         .unwrap_or_default()
@@ -4928,8 +5005,15 @@ fn reset_credit_display_days(credits: &crate::models::ResetCreditsInfo) -> Vec<S
                 .credits
                 .get(index)
                 .and_then(|credit| credit.expires_at)
-                .and_then(native_interop::system_time_to_local)
-                .map(|local| local.wDay.to_string())
+                .and_then(|expires_at| {
+                    if text_style == TextStyle::Compact {
+                        let remaining = expires_at.duration_since(now).unwrap_or_default();
+                        Some((remaining.as_secs() / 86_400).to_string())
+                    } else {
+                        native_interop::system_time_to_local(expires_at)
+                            .map(|local| local.wDay.to_string())
+                    }
+                })
                 .unwrap_or_else(|| "?".to_string())
         })
         .collect()
@@ -4942,9 +5026,10 @@ fn draw_reset_credit_grid(
     count: usize,
     credits: &crate::models::ResetCreditsInfo,
     is_dark: bool,
+    text_style: TextStyle,
 ) {
     let visible_count = count.min(MAX_RESET_CARD_CELLS);
-    let days = reset_credit_display_days(credits);
+    let days = reset_credit_display_days(credits, text_style, SystemTime::now());
     let grid_height = sc(RESET_CARD_SIZE * 2 + RESET_CARDS_GAP);
     let top = (height - grid_height) / 2;
     let cell_size = sc(RESET_CARD_SIZE);
@@ -5089,10 +5174,10 @@ fn draw_usage_bar(
                 FillRect(hdc, &rect, track_brush);
                 let _ = DeleteObject(track_brush);
                 let covered = (fill_segments - index as f64).clamp(0.0, 1.0);
-                let segment_fill_width = (seg_w as f64 * covered).round() as i32;
-                if segment_fill_width > 0 {
+                let segment_fill_height = (seg_h as f64 * covered).round() as i32;
+                if segment_fill_height > 0 {
                     let fill_rect = RECT {
-                        right: left + segment_fill_width,
+                        top: rect.bottom - segment_fill_height,
                         ..rect
                     };
                     let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
@@ -5124,7 +5209,7 @@ fn draw_usage_bar(
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(text_width),
+            right: text_x + measure_usage_text_width_in(hdc, text).unwrap_or(sc(text_width)) + sc(1),
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -5208,15 +5293,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_default_to_the_custom_appearance() {
+    fn legacy_settings_default_to_system_theme_and_segmented_bars() {
         let settings: SettingsFile = serde_json::from_str(&test_settings_json("zh-CN")).unwrap();
-        assert_eq!(settings.appearance_theme, AppearanceTheme::Dark);
+        assert_eq!(settings.appearance_theme, AppearanceTheme::System);
         assert_eq!(settings.bar_style, BarStyle::Segmented);
         assert_eq!(settings.text_style, TextStyle::Compact);
         assert!(settings.transparent_background);
         assert!(settings.show_reset_cards);
         assert_eq!(settings.tray_offset, 321);
         assert_eq!(settings.language.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn remaining_mode_reset_cards_show_whole_days_until_expiry() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let credits = crate::models::ResetCreditsInfo {
+            available_count: Some(5),
+            credits: [Some(3 * 86_400 + 3600), Some(86_399), Some(0), None]
+                .into_iter()
+                .map(|seconds| crate::models::ResetCredit {
+                    expires_at: seconds.map(|seconds| now + Duration::from_secs(seconds)),
+                })
+                .collect(),
+            details_available: true,
+        };
+        assert_eq!(
+            reset_credit_display_days(&credits, TextStyle::Compact, now),
+            vec!["3", "0", "0", "?", "?"]
+        );
+        assert_eq!(
+            SettingsFile::default().appearance_theme,
+            AppearanceTheme::System
+        );
+        assert_eq!(SettingsFile::default().bar_style, BarStyle::Segmented);
     }
 
     #[test]
