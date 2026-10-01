@@ -606,10 +606,161 @@ fn resolve_windows_codex_path() -> String {
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
-        .tls_connector(std::sync::Arc::new(tls))
-        .build())
+        .tls_connector(std::sync::Arc::new(tls));
+
+    if has_proxy_environment() {
+        // Let ureq retain its documented variable ordering and parsing.
+        diagnose::log("proxy selection: environment variables (ureq)");
+    } else if let Some(proxy) = windows_internet_proxy() {
+        match ureq::Proxy::new(format!("http://{proxy}")) {
+            Ok(proxy) => {
+                diagnose::log("proxy selection: Windows Internet Settings");
+                builder = builder.proxy(proxy);
+            }
+            Err(_) => diagnose::log("Windows Internet Settings proxy was not usable"),
+        }
+    } else {
+        diagnose::log("proxy selection: direct connection");
+    }
+
+    Ok(builder.build())
+}
+
+fn has_proxy_environment() -> bool {
+    [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var_os(name)
+            .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+    })
+}
+
+fn windows_internet_proxy() -> Option<String> {
+    const REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    unsafe {
+        let path = native_interop::wide_str(REGISTRY_PATH);
+        let mut key = windows::Win32::System::Registry::HKEY::default();
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+            REG_SZ,
+        };
+
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(path.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
+            return None;
+        }
+
+        let enabled_name = native_interop::wide_str("ProxyEnable");
+        let mut enabled = 0u32;
+        let mut enabled_type = Default::default();
+        let mut enabled_size = std::mem::size_of::<u32>() as u32;
+        let enabled_result = RegQueryValueExW(
+            key,
+            PCWSTR::from_raw(enabled_name.as_ptr()),
+            None,
+            Some(&mut enabled_type),
+            Some(&mut enabled as *mut u32 as *mut u8),
+            Some(&mut enabled_size),
+        );
+        if enabled_result.is_err()
+            || enabled_type != REG_DWORD
+            || enabled_size != std::mem::size_of::<u32>() as u32
+            || enabled == 0
+        {
+            let _ = RegCloseKey(key);
+            return None;
+        }
+
+        let server_name = native_interop::wide_str("ProxyServer");
+        let mut byte_count = 0u32;
+        let mut server_type = Default::default();
+        let size_result = RegQueryValueExW(
+            key,
+            PCWSTR::from_raw(server_name.as_ptr()),
+            None,
+            Some(&mut server_type),
+            None,
+            Some(&mut byte_count),
+        );
+        if size_result.is_err() || server_type != REG_SZ || byte_count < 2 || byte_count % 2 != 0 {
+            let _ = RegCloseKey(key);
+            return None;
+        }
+
+        let mut data = vec![0u16; byte_count as usize / 2];
+        let read_result = RegQueryValueExW(
+            key,
+            PCWSTR::from_raw(server_name.as_ptr()),
+            None,
+            Some(&mut server_type),
+            Some(data.as_mut_ptr() as *mut u8),
+            Some(&mut byte_count),
+        );
+        let _ = RegCloseKey(key);
+        if read_result.is_err() || server_type != REG_SZ || byte_count % 2 != 0 {
+            return None;
+        }
+
+        let wide = &data[..byte_count as usize / 2];
+        let end = wide.iter().position(|unit| *unit == 0).unwrap_or(wide.len());
+        let value = String::from_utf16_lossy(&wide[..end]);
+        parse_windows_proxy_server(&value)
+    }
+}
+
+fn parse_windows_proxy_server(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if !value.contains('=') {
+        return is_plain_proxy_address(value).then(|| value.to_string());
+    }
+
+    let mut http = None;
+    let mut https = None;
+    for item in value.split(';') {
+        let Some((scheme, address)) = item.trim().split_once('=') else {
+            continue;
+        };
+        let address = address.trim();
+        if !is_plain_proxy_address(address) {
+            continue;
+        }
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "http" => http = Some(address.to_string()),
+            "https" => https = Some(address.to_string()),
+            _ => {}
+        }
+    }
+    https.or(http)
+}
+
+fn is_plain_proxy_address(address: &str) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    !host.trim().is_empty()
+        && !host.chars().any(|character| matches!(character, '/' | '@' | ';' | '='))
+        && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 fn classify_http_status(status: u16) -> PollError {
@@ -1805,6 +1956,37 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_proxy_server_parser_accepts_plain_host_and_port() {
+        assert_eq!(
+            parse_windows_proxy_server("  proxy.example:8080  "),
+            Some("proxy.example:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_proxy_server_parser_prefers_https_mapping() {
+        assert_eq!(
+            parse_windows_proxy_server("http=http-proxy:8080;https=secure-proxy:8443"),
+            Some("secure-proxy:8443".to_string())
+        );
+        assert_eq!(
+            parse_windows_proxy_server("http=http-proxy:8080;socks=socks-proxy:1080"),
+            Some("http-proxy:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_proxy_server_parser_rejects_malformed_addresses() {
+        assert_eq!(parse_windows_proxy_server(""), None);
+        assert_eq!(parse_windows_proxy_server("proxy.example"), None);
+        assert_eq!(parse_windows_proxy_server("proxy.example:0"), None);
+        assert_eq!(
+            parse_windows_proxy_server("http=broken;https=also-broken"),
+            None
+        );
+    }
 
     #[test]
     fn claude_credentials_path_honors_custom_config_directory() {

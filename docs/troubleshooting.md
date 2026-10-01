@@ -14,6 +14,10 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. Transient failures use exponential backoff up to the configured refresh interval.
 
+## Windows proxy after restart
+
+Codex Usage uses proxy environment variables when configured, and otherwise reads the enabled Windows system proxy. This lets startup and Explorer launches use the same proxy without requiring terminal-only `HTTP_PROXY` or `HTTPS_PROXY` variables. Automatic proxy configuration scripts (PAC) are not supported; use a manual Windows proxy or proxy environment variables.
+
 ## Diagnostic log
 
 Run:
