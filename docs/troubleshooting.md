@@ -49,6 +49,8 @@ winget upgrade --id Ray.CodexUsage --exact
 
 Right-click the taskbar component and choose **Settings > Reset Position**. Settings are stored at `%APPDATA%\CodexUsage\settings.json`.
 
+By default, the widget keeps its placed position when tray icons or usage text change. **Settings > Anchor to taskbar right** instead keeps a fixed distance from the taskbar's right edge. Switching modes preserves the current position. Existing tray-relative positions are converted on first launch. New installations refresh once per minute; saved custom intervals are preserved.
+
 ## Reinstall while preserving settings
 
 Normal uninstall keeps the settings file. Reinstalling restores the saved language, refresh interval, provider selection, widget visibility, and taskbar position. Use `uninstall.ps1 -RemoveSettings` only when a full reset is intended.

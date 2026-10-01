@@ -96,6 +96,8 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    anchor_offset: Option<i32>,
+    anchor_taskbar_right: bool,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -160,6 +162,7 @@ const IDM_BAR_SEGMENTED: u16 = 94;
 const IDM_TEXT_DETAILED: u16 = 95;
 const IDM_TEXT_COMPACT: u16 = 96;
 const IDM_TRANSPARENT_BACKGROUND: u16 = 97;
+const IDM_ANCHOR_TASKBAR_RIGHT: u16 = 98;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -385,6 +388,10 @@ fn legacy_settings_path() -> PathBuf {
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
+    anchor_offset: Option<i32>,
+    #[serde(default)]
+    anchor_taskbar_right: bool,
+    #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
     taskbar_index: usize,
@@ -425,6 +432,8 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            anchor_offset: Some(0),
+            anchor_taskbar_right: false,
             tray_offset: 0,
             taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
@@ -448,7 +457,7 @@ impl Default for SettingsFile {
 }
 
 fn default_poll_interval() -> u32 {
-    POLL_15_MIN
+    POLL_1_MIN
 }
 
 fn default_widget_visible() -> bool {
@@ -562,6 +571,8 @@ fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
+            anchor_offset: s.anchor_offset,
+            anchor_taskbar_right: s.anchor_taskbar_right,
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
@@ -1010,22 +1021,80 @@ fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
     tray_left
 }
 
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
+fn clamp_offset_for_taskbar(taskbar_rect: RECT, offset: i32, widget_width: i32) -> i32 {
+    clamp_left_offset(offset, taskbar_rect.right - taskbar_rect.left, widget_width)
 }
 
 fn offset_for_drop_point(
-    taskbar_hwnd: HWND,
     taskbar_rect: RECT,
     pt: POINT,
     drag_start_client_x: i32,
+    widget_width: i32,
+    anchor_taskbar_right: bool,
 ) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
+    let max_left = (taskbar_rect.right - taskbar_rect.left - widget_width).max(0);
+    let offset = if anchor_taskbar_right {
+        max_left - desired_left
+    } else {
+        desired_left
+    };
+    clamp_offset_for_taskbar(taskbar_rect, offset, widget_width)
+}
+
+fn clamp_left_offset(left_offset: i32, taskbar_width: i32, widget_width: i32) -> i32 {
+    left_offset.clamp(0, (taskbar_width - widget_width).max(0))
+}
+
+fn migrate_tray_offset_to_left_offset(
+    tray_left: i32,
+    taskbar_left: i32,
+    taskbar_right: i32,
+    widget_width: i32,
+    tray_offset: i32,
+) -> i32 {
+    let old_left = tray_left - taskbar_left - widget_width - tray_offset;
+    clamp_left_offset(old_left, taskbar_right - taskbar_left, widget_width)
+}
+
+fn widget_x_from_left_offset(taskbar_left: i32, left_offset: i32, embedded: bool) -> i32 {
+    if embedded {
+        left_offset
+    } else {
+        taskbar_left + left_offset
+    }
+}
+
+fn widget_x_from_anchor(
+    taskbar_left: i32,
+    taskbar_right: i32,
+    widget_width: i32,
+    offset: i32,
+    anchor_taskbar_right: bool,
+    embedded: bool,
+) -> i32 {
+    let left_offset = if anchor_taskbar_right {
+        taskbar_right - taskbar_left - widget_width - offset
+    } else {
+        offset
+    };
+    widget_x_from_left_offset(taskbar_left, left_offset, embedded)
+}
+
+fn offset_for_anchor_mode_change(
+    offset: i32,
+    taskbar_width: i32,
+    widget_width: i32,
+) -> i32 {
+    let max_offset = (taskbar_width - widget_width).max(0);
+    clamp_left_offset(max_offset - offset, taskbar_width, widget_width)
+}
+
+fn anchor_taskbar_right_label(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::SimplifiedChinese => "锚定任务栏右侧",
+        _ => "Anchor to taskbar right",
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -2237,6 +2306,8 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                anchor_offset: settings.anchor_offset,
+                anchor_taskbar_right: settings.anchor_taskbar_right,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -3241,7 +3312,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd, preview_mode) = {
+    let (hwnd, embedded, anchor_offset, anchor_taskbar_right, tray_offset, taskbar_hwnd, preview_mode) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -3262,6 +3333,8 @@ fn position_at_taskbar() {
         (
             s.hwnd.to_hwnd(),
             s.embedded,
+            s.anchor_offset,
+            s.anchor_taskbar_right,
             s.tray_offset,
             taskbar_hwnd,
             s.preview_mode,
@@ -3296,24 +3369,25 @@ fn position_at_taskbar() {
     };
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-
     let widget_width = total_widget_width();
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
+    let anchor_offset = anchor_offset
+        .map(|offset| clamp_left_offset(offset, taskbar_rect.right - taskbar_rect.left, widget_width))
+        .unwrap_or_else(|| {
+            migrate_tray_offset_to_left_offset(
+                tray_left_for_taskbar(taskbar_hwnd, taskbar_rect),
+                taskbar_rect.left,
+                taskbar_rect.right,
+                widget_width,
+                tray_offset,
+            )
+        });
     let offset_changed = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
+            if s.anchor_offset != Some(anchor_offset) {
+                s.anchor_offset = Some(anchor_offset);
                 true
             } else {
                 false
@@ -3330,7 +3404,14 @@ fn position_at_taskbar() {
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
+        let x = widget_x_from_anchor(
+            taskbar_rect.left,
+            taskbar_rect.right,
+            widget_width,
+            anchor_offset,
+            anchor_taskbar_right,
+            true,
+        );
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
@@ -3338,7 +3419,14 @@ fn position_at_taskbar() {
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
+        let x = widget_x_from_anchor(
+            taskbar_rect.left,
+            taskbar_rect.right,
+            widget_width,
+            anchor_offset,
+            anchor_taskbar_right,
+            false,
+        );
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
@@ -3487,6 +3575,13 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    let anchored_right = lock_state()
+                        .as_ref()
+                        .map(|s| s.anchor_taskbar_right)
+                        .unwrap_or(false);
+                    if anchored_right {
+                        position_at_taskbar();
+                    }
                     render_layered();
                     schedule_countdown_timer();
                 }
@@ -3568,7 +3663,7 @@ unsafe extern "system" fn wnd_proc(
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
                 s.drag_start_client_x = client_x;
-                s.drag_start_offset = s.tray_offset;
+                s.drag_start_offset = s.anchor_offset.unwrap_or_default();
             }
             SetCapture(hwnd);
             LRESULT(0)
@@ -3606,50 +3701,42 @@ unsafe extern "system" fn wnd_proc(
                         None => return LRESULT(0),
                     };
 
-                    // Moving mouse left = positive delta = larger offset (further left)
-                    let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
-
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
+                    let delta = pt.x - s.drag_start_mouse_x;
+                    let mut new_offset = if s.anchor_taskbar_right {
+                        s.drag_start_offset - delta
+                    } else {
+                        s.drag_start_offset + delta
+                    };
 
                     let taskbar_hwnd = s.taskbar_hwnd;
                     let embedded = s.embedded;
+                    let anchor_taskbar_right = s.anchor_taskbar_right;
                     let hwnd_val = s.hwnd.to_hwnd();
 
-                    // Clamp: don't go past left edge of taskbar
                     if let Some(taskbar_hwnd) = taskbar_hwnd {
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
                             let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
+                            new_offset = clamp_left_offset(
+                                new_offset,
+                                taskbar_rect.right - taskbar_rect.left,
+                                widget_width,
+                            );
 
-                            s.tray_offset = new_offset;
+                            s.anchor_offset = Some(new_offset);
 
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
                             let widget_height = sc(WIDGET_HEIGHT);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
+                            let x = widget_x_from_anchor(
+                                taskbar_rect.left,
+                                taskbar_rect.right,
+                                widget_width,
+                                new_offset,
+                                anchor_taskbar_right,
+                                embedded,
+                            );
                             Some((
                                 hwnd_val,
                                 embedded,
@@ -3660,11 +3747,11 @@ unsafe extern "system" fn wnd_proc(
                                 widget_height,
                             ))
                         } else {
-                            s.tray_offset = new_offset;
+                            s.anchor_offset = Some(new_offset);
                             None
                         }
                     } else {
-                        s.tray_offset = new_offset;
+                        s.anchor_offset = Some(new_offset);
                         None
                     }
                 };
@@ -3708,15 +3795,18 @@ unsafe extern "system" fn wnd_proc(
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
                     if target_index != current_taskbar_index {
                         let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
                             target_taskbar.rect,
                             pt,
                             drag_start_client_x,
+                            total_widget_width(),
+                            lock_state().as_ref()
+                                .map(|s| s.anchor_taskbar_right)
+                                .unwrap_or(false),
                         );
                         {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
-                                s.tray_offset = new_offset;
+                                s.anchor_offset = Some(new_offset);
                             }
                         }
                         if attach_to_taskbar(hwnd, target_index) {
@@ -3799,11 +3889,37 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.tray_offset = 0;
+                            s.anchor_offset = Some(0);
                         }
                     }
                     save_state_settings();
                     position_at_taskbar();
+                }
+                IDM_ANCHOR_TASKBAR_RIGHT => {
+                    let should_reposition = {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if let Some(taskbar_hwnd) = s.taskbar_hwnd {
+                                if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
+                                    let width = total_widget_width_for_state(s);
+                                    let offset = s.anchor_offset.unwrap_or_default();
+                                    s.anchor_offset = Some(offset_for_anchor_mode_change(
+                                        offset,
+                                        taskbar_rect.right - taskbar_rect.left,
+                                        width,
+                                    ));
+                                }
+                            }
+                            s.anchor_taskbar_right = !s.anchor_taskbar_right;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_reposition {
+                        save_state_settings();
+                        position_at_taskbar();
+                    }
                 }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
@@ -4065,6 +4181,7 @@ fn show_context_menu(hwnd: HWND) {
             bar_style,
             text_style,
             transparent_background,
+            anchor_taskbar_right,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -4096,9 +4213,10 @@ fn show_context_menu(hwnd: HWND) {
                     s.bar_style,
                     s.text_style,
                     s.transparent_background,
+                    s.anchor_taskbar_right,
                 ),
                 None => (
-                    POLL_15_MIN,
+                    POLL_1_MIN,
                     LanguageId::English.strings(),
                     LanguageId::English,
                     None,
@@ -4118,6 +4236,7 @@ fn show_context_menu(hwnd: HWND) {
                     BarStyle::default(),
                     TextStyle::default(),
                     default_transparent_background(),
+                    false,
                 ),
             }
         };
@@ -4566,6 +4685,19 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        let anchor_right_label = native_interop::wide_str(anchor_taskbar_right_label(language));
+        let anchor_right_flags = if anchor_taskbar_right {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            anchor_right_flags,
+            IDM_ANCHOR_TASKBAR_RIGHT as usize,
+            PCWSTR::from_raw(anchor_right_label.as_ptr()),
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -5301,7 +5433,133 @@ mod tests {
         assert!(settings.transparent_background);
         assert!(settings.show_reset_cards);
         assert_eq!(settings.tray_offset, 321);
+        assert_eq!(settings.anchor_offset, None);
+        assert!(!settings.anchor_taskbar_right);
         assert_eq!(settings.language.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn new_settings_start_at_taskbar_left_and_poll_every_minute() {
+        let settings = SettingsFile::default();
+        assert_eq!(settings.anchor_offset, Some(0));
+        assert!(!settings.anchor_taskbar_right);
+        assert_eq!(settings.poll_interval_ms, POLL_1_MIN);
+        assert_eq!(default_poll_interval(), POLL_1_MIN);
+    }
+
+    #[test]
+    fn legacy_tray_offset_migrates_to_the_same_left_edge() {
+        let taskbar_left = -1920;
+        let taskbar_right = 640;
+        let tray_left = 560;
+        let widget_width = 500;
+        let tray_offset = 1800;
+        let old_left = tray_left - taskbar_left - widget_width - tray_offset;
+
+        let migrated = migrate_tray_offset_to_left_offset(
+            tray_left,
+            taskbar_left,
+            taskbar_right,
+            widget_width,
+            tray_offset,
+        );
+
+        assert_eq!(migrated, old_left);
+        assert_eq!(
+            widget_x_from_anchor(
+                taskbar_left,
+                taskbar_right,
+                widget_width,
+                migrated,
+                false,
+                false,
+            ),
+            taskbar_left + old_left
+        );
+    }
+
+    #[test]
+    fn taskbar_anchor_modes_hold_the_selected_edge_when_widget_width_changes() {
+        let taskbar_left = 100;
+        let taskbar_right = 1100;
+        let first_width = 400;
+        let larger_width = 500;
+        let offset = 30;
+
+        let left_x_before = widget_x_from_anchor(
+            taskbar_left,
+            taskbar_right,
+            first_width,
+            offset,
+            false,
+            false,
+        );
+        let left_x_after = widget_x_from_anchor(
+            taskbar_left,
+            taskbar_right,
+            larger_width,
+            offset,
+            false,
+            false,
+        );
+        assert_eq!(left_x_before, left_x_after);
+        assert_eq!(left_x_before, taskbar_left + offset);
+
+        let right_x_before = widget_x_from_anchor(
+            taskbar_left,
+            taskbar_right,
+            first_width,
+            offset,
+            true,
+            false,
+        );
+        let right_x_after = widget_x_from_anchor(
+            taskbar_left,
+            taskbar_right,
+            larger_width,
+            offset,
+            true,
+            false,
+        );
+        assert_eq!(right_x_before + first_width, taskbar_right - offset);
+        assert_eq!(right_x_after + larger_width, taskbar_right - offset);
+    }
+
+    #[test]
+    fn changing_anchor_mode_preserves_current_left_edge() {
+        let taskbar_width = 1200;
+        let widget_width = 480;
+        let left_offset = 125;
+        let right_offset = offset_for_anchor_mode_change(left_offset, taskbar_width, widget_width);
+        assert_eq!(right_offset, taskbar_width - widget_width - left_offset);
+        assert_eq!(
+            taskbar_width - widget_width - right_offset,
+            left_offset
+        );
+        assert_eq!(
+            offset_for_anchor_mode_change(right_offset, taskbar_width, widget_width),
+            left_offset
+        );
+    }
+
+    #[test]
+    fn drop_offsets_and_clamping_use_full_taskbar_width() {
+        let rect = RECT {
+            left: 100,
+            top: 0,
+            right: 1100,
+            bottom: 40,
+        };
+        let pt = POINT { x: 900, y: 20 };
+        assert_eq!(offset_for_drop_point(rect, pt, 20, 400, false), 600);
+        assert_eq!(offset_for_drop_point(rect, pt, 20, 400, true), 0);
+        assert_eq!(clamp_left_offset(900, 1000, 400), 600);
+    }
+
+    #[test]
+    fn anchor_menu_label_is_localized_for_english_and_simplified_chinese() {
+        assert_eq!(anchor_taskbar_right_label(LanguageId::English), "Anchor to taskbar right");
+        assert_eq!(anchor_taskbar_right_label(LanguageId::SimplifiedChinese), "锚定任务栏右侧");
     }
 
     #[test]
