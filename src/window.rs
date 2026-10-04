@@ -1649,12 +1649,12 @@ const MAX_RESET_CARD_CELLS: usize = 8;
 const MAX_RESET_CARD_MENU_ROWS: usize = 100;
 
 const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 18;
-const LABEL_RIGHT_MARGIN: i32 = 10;
+const DIVIDER_RIGHT_MARGIN: i32 = 6;
+const LABEL_WIDTH: i32 = 16;
+const LABEL_RIGHT_MARGIN: i32 = 2;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 96;
-const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
+const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 16;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
 const COMPACT_ENGLISH_TEXT_WIDTH: i32 = 130;
 const COMPACT_CHINESE_TEXT_WIDTH: i32 = 108;
@@ -1996,44 +1996,50 @@ fn compact_countdown(resets_at: Option<SystemTime>, language: LanguageId) -> Opt
             });
         }
     };
-    let seconds = remaining.as_secs();
-    if language == LanguageId::SimplifiedChinese {
-        if seconds >= 86_400 {
-            let days = seconds / 86_400;
-            let hours = (seconds % 86_400) / 3_600;
-            Some(if hours > 0 {
-                format!("{days}d {hours}h")
-            } else {
-                format!("{days}d")
-            })
-        } else if seconds >= 3_600 {
-            let hours = seconds / 3_600;
-            let minutes = (seconds % 3_600) / 60;
-            Some(if minutes > 0 {
-                format!("{hours}h {minutes}m")
-            } else {
-                format!("{hours}h")
-            })
-        } else if seconds >= 60 {
-            Some(format!("{}m", seconds / 60))
-        } else {
-            Some("<1m".to_string())
-        }
-    } else if seconds >= 86_400 {
+    Some(compact_countdown_from_secs(remaining.as_secs()))
+}
+
+fn compact_countdown_from_secs(seconds: u64) -> String {
+    if seconds >= 86_400 {
         let days = seconds / 86_400;
         let hours = (seconds % 86_400) / 3_600;
-        Some(if hours > 0 {
+        if hours > 0 {
             format!("{days}d {hours}h")
         } else {
             format!("{days}d")
-        })
+        }
     } else if seconds >= 3_600 {
-        Some(format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60))
+        let hours = seconds / 3_600;
+        let minutes = (seconds % 3_600) / 60;
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
     } else if seconds >= 60 {
-        Some(format!("{}m", seconds / 60))
+        format!("{}m {}s", seconds / 60, seconds % 60)
     } else {
-        Some("<1m".to_string())
+        format!("{seconds}s")
     }
+}
+
+fn compact_countdown_refresh_delay(remaining_secs: u64) -> Duration {
+    if remaining_secs < 3_600 {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(remaining_secs % 60 + 1)
+    }
+}
+
+fn reset_credit_refresh_delay(remaining_secs: u64) -> Duration {
+    let unit_secs = if remaining_secs >= 86_400 {
+        86_400
+    } else if remaining_secs >= 3_600 {
+        3_600
+    } else {
+        60
+    };
+    Duration::from_secs(remaining_secs % unit_secs + 1)
 }
 
 fn compact_usage_text(section: &crate::models::UsageSection, language: LanguageId) -> String {
@@ -3202,27 +3208,49 @@ fn schedule_countdown_timer() {
         }
     }
 
-    let delays = [
+    let usage_resets = [
         data.claude_code
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .map(|usage| [usage.session.resets_at, usage.weekly.resets_at]),
         data.codex
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .map(|usage| [usage.session.resets_at, usage.weekly.resets_at]),
         data.antigravity
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .map(|usage| [usage.session.resets_at, usage.weekly.resets_at]),
     ];
-    let min_delay = delays.into_iter().flatten().min();
+    let now = SystemTime::now();
+    let mut delays: Vec<Duration> = usage_resets
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flatten()
+        .filter_map(|reset| {
+            let poll_delay = poller::time_until_display_change(Some(reset));
+            let compact_delay = (s.text_style == TextStyle::Compact)
+                .then(|| reset.duration_since(now).ok())
+                .flatten()
+                .map(|remaining| compact_countdown_refresh_delay(remaining.as_secs()));
+            [poll_delay, compact_delay].into_iter().flatten().min()
+        })
+        .collect();
+    if s.text_style == TextStyle::Compact {
+        if let Some(credits) = data
+            .codex
+            .as_ref()
+            .and_then(|usage| usage.reset_credits.as_ref())
+        {
+            delays.extend(
+                credits
+                    .credits
+                    .iter()
+                    .filter_map(|credit| credit.expires_at)
+                    .filter_map(|expiry| expiry.duration_since(now).ok())
+                    .map(|remaining| reset_credit_refresh_delay(remaining.as_secs())),
+            );
+        }
+    }
+    let min_delay = delays.into_iter().min();
 
     let ms = min_delay
         .unwrap_or(Duration::from_secs(60))
@@ -5122,11 +5150,24 @@ fn draw_small_divider(hdc: HDC, x: i32, height: i32, is_dark: bool) {
     }
 }
 
-fn reset_credit_display_days(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetCreditUrgency {
+    Normal,
+    Soon,
+    Imminent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResetCreditDisplay {
+    label: String,
+    urgency: ResetCreditUrgency,
+}
+
+fn reset_credit_display(
     credits: &crate::models::ResetCreditsInfo,
     text_style: TextStyle,
     now: SystemTime,
-) -> Vec<String> {
+) -> Vec<ResetCreditDisplay> {
     let count = credits
         .available_count
         .unwrap_or_default()
@@ -5139,16 +5180,51 @@ fn reset_credit_display_days(
                 .and_then(|credit| credit.expires_at)
                 .and_then(|expires_at| {
                     if text_style == TextStyle::Compact {
-                        let remaining = expires_at.duration_since(now).unwrap_or_default();
-                        Some((remaining.as_secs() / 86_400).to_string())
+                        let remaining_secs = expires_at
+                            .duration_since(now)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let (label, urgency) = if remaining_secs < 3_600 {
+                            (format!("{}m", remaining_secs / 60), ResetCreditUrgency::Imminent)
+                        } else if remaining_secs < 86_400 {
+                            (format!("{}h", remaining_secs / 3_600), ResetCreditUrgency::Soon)
+                        } else {
+                            ((remaining_secs / 86_400).to_string(), ResetCreditUrgency::Normal)
+                        };
+                        Some(ResetCreditDisplay { label, urgency })
                     } else {
                         native_interop::system_time_to_local(expires_at)
-                            .map(|local| local.wDay.to_string())
+                            .map(|local| ResetCreditDisplay {
+                                label: local.wDay.to_string(),
+                                urgency: ResetCreditUrgency::Normal,
+                            })
                     }
                 })
-                .unwrap_or_else(|| "?".to_string())
+                .unwrap_or_else(|| ResetCreditDisplay {
+                    label: "?".to_string(),
+                    urgency: ResetCreditUrgency::Normal,
+                })
         })
         .collect()
+}
+
+fn reset_credit_color(urgency: ResetCreditUrgency, is_dark: bool) -> Color {
+    Color::from_hex(match (urgency, is_dark) {
+        (ResetCreditUrgency::Soon, true) => "#FFB74D",
+        (ResetCreditUrgency::Soon, false) => "#C45F00",
+        (ResetCreditUrgency::Imminent, true) => "#FF6B6B",
+        (ResetCreditUrgency::Imminent, false) => "#C62828",
+        (ResetCreditUrgency::Normal, true) => "#8A9099",
+        (ResetCreditUrgency::Normal, false) => "#535A64",
+    })
+}
+
+fn reset_credit_text_color(urgency: ResetCreditUrgency, is_dark: bool) -> Color {
+    if urgency == ResetCreditUrgency::Normal {
+        Color::from_hex(if is_dark { "#A0A6B0" } else { "#444B55" })
+    } else {
+        reset_credit_color(urgency, is_dark)
+    }
 }
 
 fn draw_reset_credit_grid(
@@ -5161,19 +5237,16 @@ fn draw_reset_credit_grid(
     text_style: TextStyle,
 ) {
     let visible_count = count.min(MAX_RESET_CARD_CELLS);
-    let days = reset_credit_display_days(credits, text_style, SystemTime::now());
+    let labels = reset_credit_display(credits, text_style, SystemTime::now());
     let grid_height = sc(RESET_CARD_SIZE * 2 + RESET_CARDS_GAP);
     let top = (height - grid_height) / 2;
     let cell_size = sc(RESET_CARD_SIZE);
     let cell_gap = sc(RESET_CARDS_GAP);
-    let border_color = Color::from_hex(if is_dark { "#8A9099" } else { "#535A64" });
-    let text_color = Color::from_hex(if is_dark { "#A0A6B0" } else { "#444B55" });
+    let normal_text_color = reset_credit_text_color(ResetCreditUrgency::Normal, is_dark);
     unsafe {
-        let border_brush = CreateSolidBrush(COLORREF(border_color.to_colorref()));
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
+        let normal_font = CreateFontW(
             sc(-10),
             0,
             0,
@@ -5189,7 +5262,23 @@ fn draw_reset_credit_grid(
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
             PCWSTR::from_raw(font_name.as_ptr()),
         );
-        let old_font = SelectObject(hdc, font);
+        let old_font = SelectObject(hdc, normal_font);
+        let compact_font = CreateFontW(
+            sc(-8),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
 
         for index in 0..visible_count {
             let col = index / 2;
@@ -5202,8 +5291,28 @@ fn draw_reset_credit_grid(
                 right: left + cell_size,
                 bottom: upper + cell_size,
             };
-            let _ = FrameRect(hdc, &rect, border_brush);
-            let value = days.get(index).map(String::as_str).unwrap_or("?");
+            let card = labels.get(index);
+            let value = card.map(|card| card.label.as_str()).unwrap_or("?");
+            let color = reset_credit_color(
+                card.map(|card| card.urgency)
+                    .unwrap_or(ResetCreditUrgency::Normal),
+                is_dark,
+            );
+            let card_brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+            let _ = FrameRect(hdc, &rect, card_brush);
+            let _ = DeleteObject(card_brush);
+            let label_color = reset_credit_text_color(
+                card.map(|card| card.urgency)
+                    .unwrap_or(ResetCreditUrgency::Normal),
+                is_dark,
+            );
+            let _ = SetTextColor(hdc, COLORREF(label_color.to_colorref()));
+            let selected_font = if value.ends_with('h') || value.ends_with('m') {
+                compact_font
+            } else {
+                normal_font
+            };
+            let card_old_font = SelectObject(hdc, selected_font);
             let mut wide: Vec<u16> = value.encode_utf16().collect();
             let mut text_rect = rect;
             let _ = DrawTextW(
@@ -5212,6 +5321,7 @@ fn draw_reset_credit_grid(
                 &mut text_rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
+            SelectObject(hdc, card_old_font);
         }
 
         if count > MAX_RESET_CARD_CELLS {
@@ -5225,6 +5335,7 @@ fn draw_reset_credit_grid(
                 right: left + sc(reset_cards_overflow_width(count)),
                 bottom: top + grid_height,
             };
+            let _ = SetTextColor(hdc, COLORREF(normal_text_color.to_colorref()));
             let _ = DrawTextW(
                 hdc,
                 &mut wide,
@@ -5233,8 +5344,8 @@ fn draw_reset_credit_grid(
             );
         }
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
-        let _ = DeleteObject(border_brush);
+        let _ = DeleteObject(compact_font);
+        let _ = DeleteObject(normal_font);
     }
 }
 
@@ -5563,11 +5674,19 @@ mod tests {
     }
 
     #[test]
-    fn remaining_mode_reset_cards_show_whole_days_until_expiry() {
+    fn remaining_mode_reset_cards_show_hours_and_minutes_with_urgency_colors() {
         let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let credits = crate::models::ResetCreditsInfo {
-            available_count: Some(5),
-            credits: [Some(3 * 86_400 + 3600), Some(86_399), Some(0), None]
+            available_count: Some(7),
+            credits: [
+                Some(3 * 86_400 + 3600),
+                Some(86_400),
+                Some(86_399),
+                Some(3600),
+                Some(3599),
+                Some(59),
+                None,
+            ]
                 .into_iter()
                 .map(|seconds| crate::models::ResetCredit {
                     expires_at: seconds.map(|seconds| now + Duration::from_secs(seconds)),
@@ -5576,8 +5695,16 @@ mod tests {
             details_available: true,
         };
         assert_eq!(
-            reset_credit_display_days(&credits, TextStyle::Compact, now),
-            vec!["3", "0", "0", "?", "?"]
+            reset_credit_display(&credits, TextStyle::Compact, now),
+            vec![
+                ResetCreditDisplay { label: "3".into(), urgency: ResetCreditUrgency::Normal },
+                ResetCreditDisplay { label: "1".into(), urgency: ResetCreditUrgency::Normal },
+                ResetCreditDisplay { label: "23h".into(), urgency: ResetCreditUrgency::Soon },
+                ResetCreditDisplay { label: "1h".into(), urgency: ResetCreditUrgency::Soon },
+                ResetCreditDisplay { label: "59m".into(), urgency: ResetCreditUrgency::Imminent },
+                ResetCreditDisplay { label: "0m".into(), urgency: ResetCreditUrgency::Imminent },
+                ResetCreditDisplay { label: "?".into(), urgency: ResetCreditUrgency::Normal },
+            ]
         );
         assert_eq!(
             SettingsFile::default().appearance_theme,
@@ -5649,6 +5776,29 @@ mod tests {
             compact_usage_text(&section, LanguageId::English),
             "56% left · 2h 15m"
         );
+    }
+
+    #[test]
+    fn compact_countdown_switches_to_minutes_and_seconds_below_an_hour() {
+        assert_eq!(compact_countdown_from_secs(3_600), "1h");
+        assert_eq!(compact_countdown_from_secs(3_599), "59m 59s");
+        assert_eq!(compact_countdown_from_secs(60), "1m 0s");
+        assert_eq!(compact_countdown_from_secs(59), "59s");
+        assert_eq!(compact_countdown_from_secs(0), "0s");
+
+        assert_eq!(compact_countdown_refresh_delay(3_600), Duration::from_secs(1));
+        assert_eq!(compact_countdown_refresh_delay(3_599), Duration::from_secs(1));
+        assert_eq!(compact_countdown_refresh_delay(65), Duration::from_secs(1));
+        assert_eq!(compact_countdown_refresh_delay(60), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn reset_credit_refresh_delay_tracks_day_hour_and_minute_boundaries() {
+        assert_eq!(reset_credit_refresh_delay(86_400), Duration::from_secs(1));
+        assert_eq!(reset_credit_refresh_delay(86_399), Duration::from_secs(3_600));
+        assert_eq!(reset_credit_refresh_delay(3_600), Duration::from_secs(1));
+        assert_eq!(reset_credit_refresh_delay(3_599), Duration::from_secs(60));
+        assert_eq!(reset_credit_refresh_delay(59), Duration::from_secs(60));
     }
 
     #[test]
