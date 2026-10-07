@@ -3670,15 +3670,11 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let preview_mode = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.preview_mode).unwrap_or(false)
             };
             if preview_mode {
-                return LRESULT(0);
-            }
-            if !is_drag_handle_point(client_x, client_y) {
                 return LRESULT(0);
             }
 
@@ -3729,7 +3725,16 @@ unsafe extern "system" fn wnd_proc(
                         None => return LRESULT(0),
                     };
 
+                    // Match the normal widget drag feel: ignore tiny pointer
+                    // jitter until the system drag threshold has been crossed.
+                    let drag_threshold = GetSystemMetrics(SM_CXDRAG).max(1);
                     let delta = pt.x - s.drag_start_mouse_x;
+                    if delta.abs() < drag_threshold
+                        && s.anchor_offset.unwrap_or_default() == s.drag_start_offset
+                    {
+                        return LRESULT(0);
+                    }
+
                     let mut new_offset = if s.anchor_taskbar_right {
                         s.drag_start_offset - delta
                     } else {

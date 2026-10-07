@@ -21,6 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_BUBBLE: usize = 6101;
 static BUBBLE: Mutex<(isize, Vec<u16>, Option<Instant>, bool)> = Mutex::new((0, Vec::new(), None, false));
+static BUBBLE_ROWS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
+static BUBBLE_LANGUAGE: Mutex<Option<LanguageId>> = Mutex::new(None);
+static LAST_CONTENT_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static TOTAL: Mutex<Option<(Usage, usize, usize)>> = Mutex::new(None);
 
@@ -99,29 +102,82 @@ pub fn start(_hwnd: HWND) {
     });
 }
 
-pub fn show(hwnd: HWND, language: LanguageId) {
-    let mut rows = vec![account_panel::section(language, Key::Title), account_panel::section(language, Key::Local)];
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 { grouped.push(','); }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn current_rows(language: LanguageId) -> Vec<Row> {
+    let mut rows = Vec::new();
     match *TOTAL.lock().unwrap() {
         Some((u, count, errors)) => {
+            rows.push(account_panel::section(language, Key::Local));
             for (key, n) in [(Key::Input, u.input_tokens), (Key::Cached, u.cached_input_tokens),
                 (Key::Output, u.output_tokens), (Key::Reasoning, u.reasoning_output_tokens)] {
-                rows.push(account_panel::row(language, key, n.to_string()));
+                rows.push(account_panel::row(language, key, format_count(n)));
             }
-            let unit = match language {
+            let summary = match language {
                 LanguageId::SimplifiedChinese => "亿",
                 LanguageId::TraditionalChinese => "億",
                 LanguageId::Japanese => "億",
                 LanguageId::Korean => "억",
-                _ => "×100M",
+                _ => "M",
             };
-            rows.push(account_panel::row(language, Key::Total, format!("{} ({:.3} {})", u.total_tokens, u.total_tokens as f64 / 100_000_000.0, unit)));
-            rows.push(account_panel::row(language, Key::Sessions, count.to_string()));
-            rows.push(account_panel::row(language, Key::Unreadable, errors.to_string()));
+            let total = if matches!(language, LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese | LanguageId::Japanese | LanguageId::Korean) {
+                format!("{} ({:.1} {})", format_count(u.total_tokens), u.total_tokens as f64 / 100_000_000.0, summary)
+            } else {
+                format!("{} ({:.2}M)", format_count(u.total_tokens), u.total_tokens as f64 / 1_000_000.0)
+            };
+            rows.push(account_panel::row(language, Key::Total, total));
+            rows.push(account_panel::row(language, Key::Sessions, format_count(count as u64)));
+            rows.push(account_panel::row(language, Key::Unreadable, format_count(errors as u64)));
         }
-        None => rows.push(account_panel::row(language, Key::Local, account_panel::label(language, Key::NoData).into())),
+        None => {}
     }
     rows.extend(account_panel::rows(language));
-    let text = serde_json::to_string(&rows).unwrap_or_default();    unsafe {
+    if !rows.is_empty() {
+        rows.insert(0, Row {
+            title: account_panel::label(language, Key::TimeZone).into(),
+            value: String::new(),
+            section: false,
+            column: 2,
+            card: false,
+            badge: String::new(),
+            badge_tone: 0,
+            refresh_line: None,
+        });
+    }
+    rows
+}
+
+fn refresh_only_line_changed(old: &Row, new: &Row) -> Option<usize> {
+    let line_index = old.refresh_line?;
+    if new.refresh_line != Some(line_index) { return None; }
+    let mut old_normalized = old.clone();
+    let mut new_normalized = new.clone();
+    let mut old_lines: Vec<String> = old.value.lines().map(str::to_owned).collect();
+    let mut new_lines: Vec<String> = new.value.lines().map(str::to_owned).collect();
+    if line_index >= old_lines.len() || line_index >= new_lines.len() { return None; }
+    old_lines[line_index] = "<refresh-line>".into();
+    new_lines[line_index] = "<refresh-line>".into();
+    old_normalized.value = old_lines.join("\n");
+    new_normalized.value = new_lines.join("\n");
+    (old_normalized == new_normalized).then_some(line_index)
+}
+
+pub fn show(hwnd: HWND, language: LanguageId) {
+    let rows = current_rows(language);
+    if rows.is_empty() {
+        hide(hwnd);
+        return;
+    }
+    *BUBBLE_ROWS.lock().unwrap() = rows.clone();
+    unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();
         let class = WNDCLASSW {
             style: CS_DROPSHADOW,
@@ -131,7 +187,6 @@ pub fn show(hwnd: HWND, language: LanguageId) {
             ..Default::default()
         };
         RegisterClassW(&class);
-        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
         let scale = GetDpiForWindow(hwnd).max(96) as i32;
 
         let mut pt = POINT::default();
@@ -140,7 +195,7 @@ pub fn show(hwnd: HWND, language: LanguageId) {
         let mut monitor_info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
         let work = monitor_info.rcWork;
-        let width = (1080 * scale / 96).min((work.right - work.left - 32).max(300));
+        let width = (920 * scale / 96).min((work.right - work.left - 32).max(300));
         let dc = GetDC(hwnd);
         let font = make_font(scale, true);
         let old = SelectObject(dc, font);
@@ -156,7 +211,7 @@ pub fn show(hwnd: HWND, language: LanguageId) {
             if bubble.0 == 0 {
                 // No taskbar owner or parent: this is an independent top-level popup.
                 let result = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                    w!("CodexTokenBubble"), PCWSTR(wide.as_ptr()), WS_POPUP | WS_VSCROLL,
+                    w!("CodexTokenBubble"), PCWSTR::null(), WS_POPUP | WS_VSCROLL,
                     x, y, width, height, None, None, instance, None);
                 let Ok(window) = result else {
                     crate::diagnose::log("Unable to create Token popup");
@@ -166,9 +221,10 @@ pub fn show(hwnd: HWND, language: LanguageId) {
             }
             bubble.2 = Some(Instant::now());
             bubble.3 = false;
+            *BUBBLE_LANGUAGE.lock().unwrap() = Some(language);
+            *LAST_CONTENT_REFRESH.lock().unwrap() = Some(Instant::now());
             HWND(bubble.0 as *mut _)
         };
-        let _ = SetWindowTextW(window, PCWSTR(wide.as_ptr()));
         SetScrollPos(window, SB_VERT, 0, false);
         let _ = SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = InvalidateRect(window, None, false);
@@ -190,36 +246,78 @@ unsafe fn measure(dc: HDC, text: &str, width: i32) -> i32 {
     (rect.bottom - rect.top).max(16)
 }
 
-// Balance complete title/value pairs across columns. Each pair wraps independently.
+unsafe fn measure_width(dc: HDC, text: &str) -> i32 {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = RECT::default();
+    DrawTextW(dc, &mut wide, &mut rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    rect.right - rect.left
+}
+
+// Keep the reset-card list in a dedicated right column and let each column grow independently.
 unsafe fn layout(dc: HDC, rows: &[Row], width: i32, scale: i32) -> (Vec<(RECT, RECT)>, i32) {
-    let pad = 18 * scale / 96;
-    let columns = if width >= 850 * scale / 96 { 3 } else { 2 };
-    let col_width = (width - pad * (columns + 1)) / columns;
-    let heights: Vec<(i32, i32)> = rows.iter().map(|r| (
-        measure(dc, &r.title, col_width),
-        if r.section { 0 } else { measure(dc, &r.value, col_width) },
-    )).collect();
-    let sum: i32 = heights.iter().map(|(a,b)| a + b + pad).sum();
-    let target = (sum + columns - 1) / columns;
-    let mut col = 0;
-    let mut y = pad;
-    let mut bottom = y;
+    let pad = 16 * scale / 96;
+    let has_right_column = rows.iter().any(|row| row.column == 1);
+    let columns = if has_right_column && width >= 640 * scale / 96 { 2 } else { 1 };
+    let gutter = 20 * scale / 96;
+    let col_width = if columns == 2 { (width - pad * 2 - gutter) / 2 } else { width - pad * 2 };
+    let label_gap = 8 * scale / 96;
+    let label_width = (col_width * 42 / 100).max(100 * scale / 96).min(col_width - label_gap);
+    let value_width = col_width - label_width - label_gap;
+    let card_pad = 12 * scale / 96;
+    let heading_gap = 12 * scale / 96;
+    let mut column_bottoms = [pad, pad];
     let mut positions = Vec::new();
-    for (i, (label_height, value_height)) in heights.into_iter().enumerate() {
-        let h = label_height + value_height + pad;
-        if y > pad && y + h - pad > target && col < columns - 1 && !rows[i - 1].section {
-            col += 1;
-            y = pad;
+    for row in rows {
+        if row.column == 2 {
+            let y = *column_bottoms.iter().max().unwrap_or(&pad);
+            let title_height = measure(dc, &row.title, width - pad * 2);
+            let title = RECT { left: pad, top: y, right: width - pad, bottom: y + title_height };
+            positions.push((title, RECT::default()));
+            let bottom = title.bottom + 8 * scale / 96;
+            column_bottoms = [bottom, bottom];
+            continue;
         }
-        let x = pad + col * (col_width + pad);
+        let column = if columns == 2 { row.column.min(1) as usize } else { 0 };
+        let x = pad + column as i32 * (col_width + gutter);
+        let y = &mut column_bottoms[column];
+        if *y > pad && (row.section || row.card) { *y += heading_gap; }
+
+        if row.card {
+            let inner_width = col_width - card_pad * 2;
+            let title_height = measure(dc, &row.title, inner_width);
+            let value_height = measure(dc, &row.value, inner_width);
+            let title = RECT {
+                left: x + card_pad,
+                top: *y + card_pad,
+                right: x + col_width - card_pad,
+                bottom: *y + card_pad + title_height,
+            };
+            let value_top = title.bottom + 6 * scale / 96;
+            let value = RECT {
+                left: title.left,
+                top: value_top,
+                right: title.right,
+                bottom: value_top + value_height,
+            };
+            positions.push((title, value));
+            *y += card_pad * 2 + title_height + 6 * scale / 96 + value_height;
+            *y += 8 * scale / 96;
+            continue;
+        }
+
+        let title_width = if row.section { col_width } else { label_width };
+        let title_height = measure(dc, &row.title, title_width);
+        let value_height = if row.section { 0 } else { measure(dc, &row.value, value_width) };
+        let value_x = if row.section { x + col_width } else { x + label_width + label_gap };
         positions.push((
-            RECT { left: x, top: y, right: x + col_width, bottom: y + label_height },
-            RECT { left: x, top: y + label_height + 3 * scale / 96, right: x + col_width, bottom: y + label_height + value_height + 3 * scale / 96 },
+            RECT { left: x, top: *y, right: x + title_width, bottom: *y + title_height },
+            RECT { left: value_x, top: *y, right: x + col_width, bottom: *y + value_height },
         ));
-        y += h;
-        bottom = bottom.max(y);
+        if row.section { *y += title_height + 11 * scale / 96; }
+        else { *y += title_height.max(value_height) + 5 * scale / 96; }
     }
-    (positions, bottom)
+    let content_bottom = *column_bottoms.iter().max().unwrap_or(&pad);
+    (positions, content_bottom + pad)
 }
 
 unsafe fn draw(dc: HDC, text: &str, rect: &mut RECT) {
@@ -240,12 +338,11 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let scale = GetDpiForWindow(hwnd).max(96) as i32;
             let normal = make_font(scale, false);
             let bold = make_font(scale, true);
+            let card_background = CreateSolidBrush(COLORREF(0x00E8F7FF));
+            let card_border = CreateSolidBrush(COLORREF(0x00B8D5E6));
             let old = SelectObject(dc, bold);
             SetBkMode(dc, TRANSPARENT);
-            let mut text = vec![0u16; GetWindowTextLengthW(hwnd) as usize + 1];
-            let len = GetWindowTextW(hwnd, &mut text);
-            let json = String::from_utf16_lossy(&text[..len as usize]);
-            let rows: Vec<Row> = serde_json::from_str(&json).unwrap_or_default();
+            let rows = BUBBLE_ROWS.lock().unwrap().clone();
             let (positions, height) = layout(dc, &rows, client.right, scale);
             let scroll = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE, nMin: 0, nMax: height - 1,
@@ -256,21 +353,67 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 title.top -= offset; title.bottom -= offset;
                 value.top -= offset; value.bottom -= offset;
                 if value.bottom < 0 || title.top > client.bottom { continue; }
-                SelectObject(dc, if row.section { bold } else { normal });
-                SetTextColor(dc, COLORREF(if row.section { 0x003A5D79 } else { 0x005D6D78 }));
-                draw(dc, &row.title, &mut title);
-                if row.section {
+                if row.card {
+                    let inset = 12 * scale / 96;
+                    let card_rect = RECT {
+                        left: title.left - inset,
+                        top: title.top - inset,
+                        right: value.right + inset,
+                        bottom: value.bottom + inset,
+                    };
+                    FillRect(dc, &card_rect, card_background);
+                    FrameRect(dc, &card_rect, card_border);
+                    SelectObject(dc, bold);
+                    SetTextColor(dc, COLORREF(0x003A5D79));
+                    if !row.badge.is_empty() {
+                        let text_width = measure_width(dc, &row.badge);
+                        let badge_width = text_width + 16 * scale / 96;
+                        let badge_height = 21 * scale / 96;
+                        let badge = RECT { left: value.right - badge_width, top: title.top - 1 * scale / 96,
+                            right: value.right, bottom: title.top + badge_height };
+                        let (background, foreground) = match row.badge_tone {
+                            1 => (COLORREF(0x00E4F3E6), COLORREF(0x002B6B3F)),
+                            2 => (COLORREF(0x00DDEEFF), COLORREF(0x00694714)),
+                            3 => (COLORREF(0x00E7E9EB), COLORREF(0x00535B61)),
+                            _ => (COLORREF(0x00E8F0F4), COLORREF(0x003A5D79)),
+                        };
+                        let badge_brush = CreateSolidBrush(background);
+                        FillRect(dc, &badge, badge_brush);
+                        let _ = DeleteObject(badge_brush);
+                        let mut badge_text = badge;
+                        SetTextColor(dc, foreground);
+                        let mut wide: Vec<u16> = row.badge.encode_utf16().collect();
+                        DrawTextW(dc, &mut wide, &mut badge_text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        title.right = badge.left - 8 * scale / 96;
+                    }
+                    draw(dc, &row.title, &mut title);
+                    SelectObject(dc, normal);
+                    SetTextColor(dc, COLORREF(0x00222222));
+                    draw(dc, &row.value, &mut value);
+                } else if row.section {
+                    SelectObject(dc, bold);
+                    SetTextColor(dc, COLORREF(0x003A5D79));
+                    draw(dc, &row.title, &mut title);
                     let line = RECT { left: title.left, top: title.bottom + 5, right: title.right, bottom: title.bottom + 6 };
                     let line_brush = CreateSolidBrush(COLORREF(0x00A8CEDC));
                     FillRect(dc, &line, line_brush);
                     let _ = DeleteObject(line_brush);
+                } else if row.column == 2 {
+                    SelectObject(dc, normal);
+                    SetTextColor(dc, COLORREF(0x007B858B));
+                    draw(dc, &row.title, &mut title);
                 } else {
+                    SelectObject(dc, normal);
+                    SetTextColor(dc, COLORREF(0x005D6D78));
+                    draw(dc, &row.title, &mut title);
                     SelectObject(dc, bold);
                     SetTextColor(dc, COLORREF(0x00222222));
                     draw(dc, &row.value, &mut value);
                 }
             }
             SelectObject(dc, old);
+            let _ = DeleteObject(card_background);
+            let _ = DeleteObject(card_border);
             let _ = DeleteObject(normal);
             let _ = DeleteObject(bold);
             let _ = EndPaint(hwnd, &paint);
@@ -305,6 +448,9 @@ pub fn hide(hwnd: HWND) {
         let mut bubble = BUBBLE.lock().unwrap();
         if bubble.0 != 0 { let _ = ShowWindow(HWND(bubble.0 as *mut _), SW_HIDE); }
         bubble.2 = None;
+        *BUBBLE_LANGUAGE.lock().unwrap() = None;
+        *LAST_CONTENT_REFRESH.lock().unwrap() = None;
+        BUBBLE_ROWS.lock().unwrap().clear();
         let _ = KillTimer(hwnd, TIMER_BUBBLE);
     }
 }
@@ -325,6 +471,106 @@ pub fn tick(hwnd: HWND) {
             outside && !in_bubble && bubble.2.is_some_and(|t| t.elapsed() >= Duration::from_millis(300))
         };
         if dismiss || GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 { hide(hwnd); }
+        else {
+            let refresh = {
+                let mut last = LAST_CONTENT_REFRESH.lock().unwrap();
+                if last.is_some_and(|t| t.elapsed() >= Duration::from_secs(1)) {
+                    *last = Some(Instant::now());
+                    true
+                } else { false }
+            };
+            if refresh {
+                if let Some(language) = *BUBBLE_LANGUAGE.lock().unwrap() {
+                    let rows = current_rows(language);
+                    if !rows.is_empty() {
+                        let (full_redraw, changed_rows) = {
+                            let mut current = BUBBLE_ROWS.lock().unwrap();
+                            if *current == rows { (false, Vec::new()) }
+                            else {
+                                let indices = if current.len() == rows.len() {
+                                    Some(current.iter().zip(&rows).enumerate()
+                                        .filter_map(|(index, (old, new))| {
+                                            (old != new).then_some((index, refresh_only_line_changed(old, new)))
+                                        })
+                                        .collect::<Vec<_>>())
+                                } else { None };
+                                *current = rows.clone();
+                                match indices {
+                                    Some(indices) => (false, indices),
+                                    None => (true, Vec::new()),
+                                }
+                            }
+                        };
+                        let popup = BUBBLE.lock().unwrap().0;
+                        if popup != 0 && (full_redraw || !changed_rows.is_empty()) {
+                            let popup = HWND(popup as *mut _);
+                            if full_redraw {
+                                let _ = InvalidateRect(popup, None, false);
+                            } else {
+                                let mut client = RECT::default();
+                                if GetClientRect(popup, &mut client).is_ok() {
+                                    let scale = GetDpiForWindow(popup).max(96) as i32;
+                                    let dc = GetDC(popup);
+                                    let font = make_font(scale, true);
+                                    let old = SelectObject(dc, font);
+                                    let (positions, _) = layout(dc, &rows, client.right, scale);
+                                    let scroll_offset = GetScrollPos(popup, SB_VERT);
+                                    let mut dirty_regions = Vec::new();
+                                    for (index, refresh_line) in changed_rows {
+                                        let Some((mut title, mut value)) = positions.get(index).copied() else { continue; };
+                                        title.top -= scroll_offset;
+                                        title.bottom -= scroll_offset;
+                                        value.top -= scroll_offset;
+                                        value.bottom -= scroll_offset;
+                                        let scale_margin = 2 * scale / 96;
+                                        let dirty = if rows[index].card {
+                                            if let Some(line_index) = refresh_line {
+                                                let lines: Vec<&str> = rows[index].value.lines().collect();
+                                                let Some(line) = lines.get(line_index) else { continue; };
+                                                let line_width = value.right - value.left;
+                                                let preceding_height: i32 = lines.iter().take(line_index)
+                                                    .map(|text| measure(dc, text, line_width)).sum();
+                                                let line_height = measure(dc, line, line_width);
+                                                let line_width = measure_width(dc, line).min(line_width);
+                                                RECT {
+                                                    left: value.left - scale_margin,
+                                                    top: value.top + preceding_height - scale_margin,
+                                                    right: value.left + line_width + scale_margin,
+                                                    bottom: value.top + preceding_height + line_height + scale_margin,
+                                                }
+                                            } else {
+                                                let inset = 12 * scale / 96;
+                                                RECT { left: title.left - inset, top: title.top - inset,
+                                                    right: value.right + inset, bottom: value.bottom + inset }
+                                            }
+                                        } else {
+                                            RECT { left: title.left, top: title.top - scale_margin,
+                                                right: value.right.max(title.right),
+                                                bottom: title.bottom.max(value.bottom) + scale_margin }
+                                        };
+                                        let mut dirty = dirty;
+                                        dirty.left = dirty.left.max(0);
+                                        dirty.top = dirty.top.max(0);
+                                        dirty.right = dirty.right.min(client.right);
+                                        dirty.bottom = dirty.bottom.min(client.bottom);
+                                        if dirty.left < dirty.right && dirty.top < dirty.bottom {
+                                            dirty_regions.push(dirty);
+                                        }
+                                    }
+                                    SelectObject(dc, old);
+                                    let _ = DeleteObject(font);
+                                    ReleaseDC(popup, dc);
+                                    for dirty in dirty_regions {
+                                        let _ = InvalidateRect(popup, Some(&dirty), false);
+                                    }
+                                }
+                            }
+                            let _ = UpdateWindow(popup);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 pub fn stop() {
@@ -354,8 +600,8 @@ mod tests {
                     assert_eq!(positions.len(), rows.len());
                     assert!(height > 0);
                     for (title, value) in positions {
-                        assert!(title.left >= 0 && value.right <= width);
-                        assert!(value.top >= title.bottom);
+                        assert!(title.left >= 0 && title.right <= width && value.right <= width);
+                        assert_eq!(value.top, title.top);
                         assert!(value.bottom < height);
                     }
                 }
